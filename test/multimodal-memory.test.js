@@ -60,6 +60,7 @@ test('image opt-in reroutes memory work only, and never unrelated text helpers',
   const settings = normalizeSettings({ memoryImages: true, provider: 'fixture', model: 'vision' });
   const context = new AsyncLocalStorage();
   const feature = createMemoryFeature({ settings: () => settings, context, parseFile: fixture.parser(),
+    stateFile: path.join(path.dirname(file), 'automation.json'),
     sourceFile: () => file, projectOf: () => 'fixture', runInternalModel: async () => ({ content: [] }) });
   assert.equal(feature.routeCall({ text: 'review or naming', images: [] }, 'text').modelOnly, false);
   await context.run({ memory: true }, async () => {
