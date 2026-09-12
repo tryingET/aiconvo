@@ -19,6 +19,8 @@ const zlib = require('zlib');
 const { claudeForkContent, groupFamilies } = require('./sessionfork.js');
 const { readSessionSnapshot, publishSession } = require('./session-snapshot.js');
 const settingsLib = require('./settings.js');
+const memoryImages = require('./memory-images');
+const { createMemoryFeature } = require('./memory-feature');
 const snippetsLib = require('./snippets.js');
 const memoryFingerprint = require('./memory-fingerprint.js');
 const { openSearchIndex, SearchIndex } = require('./searchindex.js');
@@ -639,7 +641,8 @@ async function indexFile(source, relPath, stat) {
   const absPath = path.join(SOURCES[source], relPath);
   const prev = index[key];
   try {
-    const { meta, messages, entryParents } = await parseFile(absPath);
+    const snapshot = memoryFeature.enabled() ? memoryImages.sourceSnapshot(absPath) : null;
+    const { meta, messages, entryParents } = await parseFile(absPath, snapshot ? snapshot.text : null);
     let delegated = null;
     if (source === 'pi' && relPath.startsWith('--delegated--' + path.sep) && meta.sessionId) {
       try {
@@ -654,7 +657,8 @@ async function indexFile(source, relPath, stat) {
     const firstUser = titleSourceMessage(messages);
     const fullTitle = delegated ? delegated.title : firstUser ? firstUser.text.slice(0, 200).replace(/\s+/g, ' ').trim() : '(no user message)';
     const titleHash = crypto.createHash('sha256').update('v2\x00' + fullTitle).digest('hex').slice(0, 16);
-    const memoryHash = memoryFingerprint.fingerprint(messages);
+    const memoryHash = snapshot
+      ? memoryFeature.fingerprint(snapshot.revision) : memoryFingerprint.fingerprint(messages);
     const savedTimelineTitle = timelineTitles[key];
     // A manual (or user-requested AI) title override wins over anything re-derived here.
     const manualTitle = savedTimelineTitle && savedTimelineTitle.manual ? savedTimelineTitle : null;
@@ -686,6 +690,8 @@ async function indexFile(source, relPath, stat) {
           ? savedTimelineTitle.title : timelineTitle(fullTitle),
       timelineTitleHash: titleHash,
       memoryHash,
+      sourceRevision: snapshot?.revision || null,
+      memoryImages: appSettings.memoryImages,
       firstTs: meta.firstTs,
       lastTs: meta.lastTs,
       userCount: messages.filter(m => m.role === 'user').length,
@@ -745,7 +751,8 @@ async function fullScan() {
       let stat;
       try { stat = await fsp.stat(path.join(baseDir, relPath)); } catch { continue; }
       const cur = index[key];
-      if (!cur || cur.v !== CACHE_VERSION || cur.mtimeMs !== stat.mtimeMs || cur.size !== stat.size) {
+      if (!cur || cur.v !== CACHE_VERSION || cur.mtimeMs !== stat.mtimeMs || cur.size !== stat.size ||
+          (memoryFeature.enabled() && (!cur.sourceRevision || cur.memoryImages !== appSettings.memoryImages))) {
         await indexFile(source, relPath, stat);
         n++;
       }
@@ -817,7 +824,8 @@ function reindexIfChanged(key) {
     try { stat = await fsp.stat(path.join(baseDir, relPath)); }
     catch (e) { if (e.code === 'ENOENT') dropIndexed(key); else console.error('reindex stat failed:', key, e.message); return; }
     const cur = index[key];
-    if (cur && cur.v === CACHE_VERSION && cur.mtimeMs === stat.mtimeMs && cur.size === stat.size) return;
+    if (cur && cur.v === CACHE_VERSION && cur.mtimeMs === stat.mtimeMs && cur.size === stat.size &&
+        (!memoryFeature.enabled() || (cur.sourceRevision && cur.memoryImages === appSettings.memoryImages))) return;
     const t0 = Date.now();
     await indexFile(source, relPath, stat);
     parseCostMs.set(key, Date.now() - t0);
@@ -2842,8 +2850,9 @@ fs.mkdirSync(EPIC_INPUTS_DIR, { recursive: true });
 // Epics keep a stable group of conversations and a generated cross-session timeline.
 let epics = {};
 try { epics = JSON.parse(fs.readFileSync(EPICS_FILE, 'utf8')); } catch {}
-function saveEpics() {
-  fs.writeFile(EPICS_FILE, JSON.stringify(epics), () => {});
+function saveEpics({ guard, value = epics } = {}) {
+  if (guard) return writeFileAtomic(EPICS_FILE, JSON.stringify(value), { guard, sync: true, syncDirectory: true });
+  fs.writeFile(EPICS_FILE, JSON.stringify(value), () => {});
 }
 const epicPathFor = id => path.join(EPICS_DIR, id + '.md');
 const epicInputsPathFor = id => path.join(EPIC_INPUTS_DIR, id + '.json');
@@ -3543,6 +3552,18 @@ function saveAppSettings() {
   fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings, null, 2) + '\n', { mode: 0o600 });
 }
+const memoryFeature = createMemoryFeature({
+  settings: () => appSettings, context: modelCallContext, parseFile,
+  sourceFile: absPathForKey,
+  projectOf: key => projectNameOf(index[key]?.cwd, key),
+  claudeCodeExtension: () => fs.existsSync(CLAUDE_CODE_EXT) ? CLAUDE_CODE_EXT : '',
+  usage(message) {
+    if (!message.usage) return;
+    const record = { type: 'message', id: crypto.randomUUID(), parentId: null,
+      timestamp: new Date(message.timestamp || Date.now()).toISOString(), aiconvoCategory: 'internal', message: { ...message, content: [] } };
+    try { fs.appendFileSync(INTERNAL_USAGE_FILE, JSON.stringify(record) + '\n', { mode: 0o600 }); } catch {}
+  },
+});
 function readPiDefault() {
   try {
     const raw = JSON.parse(fs.readFileSync(PI_SETTINGS_FILE, 'utf8'));
@@ -3589,7 +3610,9 @@ function listPiModels(force = false) {
   }
   if (modelsPending) return modelsPending;
   modelsPending = new Promise(resolve => {
-    execFile('pi', ['--list-models'], { timeout: 60000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const catalogArgs = memoryFeature.enabled() || Object.keys(appSettings.providerExtensions).length
+      ? [...piArgs().filter(arg => arg !== '-p'), '--list-models'] : ['--list-models'];
+    execFile('pi', catalogArgs, { timeout: 60000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       const parsed = err ? [] : settingsLib.parseListModels(stdout);
       if (err) {
         modelsCache = {
@@ -3816,6 +3839,12 @@ async function runPi(fileContent, prompt, onChunk, options = {}) {
   const guard = () => { try { options.guard?.(); } catch (e) { guardFailure = e; throw e; } };
   guard();
   if (!appSettings.aiTitles && [TITLE_PROMPT, RETITLE_PROMPT, PROJECT_RETITLE_PROMPT, TIMELINE_TITLE_PROMPT, DOC_COMMIT_TITLE_PROMPT].includes(prompt)) requireAiTitles();
+  const route = memoryFeature.routeCall({ text: fileContent, images: [] }, prompt, { ...options, onChunk });
+  if (route.modelOnly) {
+    const result = await route.invoke();
+    guard();
+    return result;
+  }
   const tmp = path.join(os.tmpdir(), 'aiconvo-distill-' + process.pid + '-' + Math.random().toString(36).slice(2) + '.md');
   fs.writeFileSync(tmp, fileContent, { mode: 0o600 });
   const inherited = modelCallContext.getStore();
@@ -4162,6 +4191,10 @@ function renderNode(n, depth, parts) {
 }
 
 async function distill(data, emit = () => {}) {
+  if (appSettings.memoryImages) {
+    const built = await memoryFeature.build(data);
+    return { note: built.note, outline: '', guard: built.guard, hasAbstract: true };
+  }
   emit({ type: 'status', text: 'Mapping the problem tree…' });
   const full = numberedTranscript(data.messages);
   let prior = null;
@@ -4243,7 +4276,8 @@ function noteFileFor(data, title) {
   const slug = (title || data.title || 'session').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   // Without AI titles the slug falls back to the source title, so two sessions
   // on the same day can collide. A session-derived suffix keeps them distinct.
-  const identity = appSettings.aiTitles ? '' : '-' + crypto.createHash('sha256').update(data.key).digest('hex').slice(0, 16);
+  const identity = (!appSettings.aiTitles || memoryFeature.enabled())
+    ? '-' + crypto.createHash('sha256').update(data.key).digest('hex').slice(0, 16) : '';
   return path.join(NOTES_DIR, `${date}-${slug}${identity}.md`);
 }
 
@@ -4396,7 +4430,14 @@ async function existingEvidenceFor(data, allowStale = false) {
   return null;
 }
 
-async function epicEvidenceFor(data, emit = () => {}, forceCard = false) {
+async function epicEvidenceFor(data, emit = () => {}, forceCard = false, guard = () => {}) {
+  guard();
+  if (appSettings.memoryImages) {
+    const built = await memoryFeature.build(data, guard);
+    guard(); built.guard();
+    return { text: built.note, kind: 'card', source: 'multimodal-evidence', hash: built.memoryHash,
+      sourceRevision: built.sourceRevision, guard: built.guard, outdated: false, created: true };
+  }
   if (!forceCard) {
     const existing = await existingEvidenceFor(data);
     if (existing) return existing;
@@ -4623,6 +4664,10 @@ async function readLeaf(key) {
 
 function leafStateFor(entry, leaf) {
   if (!leaf) return 'missing';
+  if (appSettings.memoryImages || leaf.sourceRevision) {
+    if (leaf.memoryImages !== appSettings.memoryImages || !entry?.sourceRevision || leaf.sourceRevision !== entry.sourceRevision ||
+        leaf.memoryHash !== memoryFeature.fingerprint(entry.sourceRevision)) return 'stale';
+  }
   if (leaf.partial) return 'seeded'; // intent lane only (migrated from an old build)
   if ((leaf.v || 1) < LEAF_VERSION) return 'stale'; // older extraction quality — re-extract on the next backfill
   return leaf.memoryHash && entry && leaf.memoryHash === entry.memoryHash ? 'fresh' : 'stale';
@@ -4645,6 +4690,14 @@ async function projectPrimerFor(project) {
 // verbatim intent quotes are attached here from the transcript — the model
 // only returns ids.
 async function extractLeaf(key) {
+  if (appSettings.memoryImages) {
+    const data = JSON.parse(await fsp.readFile(cachePathFor(key), 'utf8'));
+    const built = await memoryFeature.build(data);
+    await fsp.mkdir(MEMORY_LEAVES_DIR, { recursive: true });
+    await writeFileAtomic(leafPathFor(key), JSON.stringify(built.leaf), { guard: built.guard });
+    memoryLeafCache.delete(key);
+    return built.leaf;
+  }
   const entry = index[key];
   if (!entry) throw new Error('unknown conversation: ' + key);
   const memoryHash = entry.memoryHash || null; // captured before the call: growth during the job leaves the leaf correctly stale
@@ -4740,7 +4793,7 @@ async function extractLeaf(key) {
     abstract, intent, environment, problems,
   };
   await fsp.mkdir(MEMORY_LEAVES_DIR, { recursive: true });
-  await writeFileAtomic(leafPathFor(key), JSON.stringify(leaf));
+  await writeFileAtomic(leafPathFor(key), JSON.stringify(leaf), { guard: memoryFeature.check });
   memoryLeafCache.delete(key);
   return leaf;
 }
@@ -4878,7 +4931,12 @@ async function weighIntentCandidates(project, overview, candidates, emit, step, 
   const tiers = new Map();
   if (!candidates.length) return tiers;
   const header = `PROJECT: ${project}\nCURRENT OVERVIEW: ${clipped(JSON.stringify(overview), 2000)}\n\n`;
-  const blockOf = q => JSON.stringify({
+  const blockOf = q => JSON.stringify(appSettings.memoryImages ? {
+    id: q.id, date: String(q.ts || '?').slice(0, 10), kind: q.kind, force: q.force || null,
+    situation: q.situation || null, reason: q.reason || null, quote: clipped(q.user, 900),
+    offBranch: !!q.offBranch, entry: q.entry, assistantBeforeEntry: q.assistantBeforeEntry,
+    assistantBefore: clipped(q.assistantBefore, 900), images: q.images,
+  } : {
     id: q.id, date: String(q.ts || '?').slice(0, 10), kind: q.kind, force: q.force || null,
     situation: q.situation || null, reason: q.reason || null, quote: clipped(q.user, 900),
   });
@@ -4899,7 +4957,9 @@ async function weighIntentCandidates(project, overview, candidates, emit, step, 
   // rows it corrects. This keeps the output tiny regardless of project size
   // (a full rewrite of 800+ rows can exceed the provider output cap).
   const deltaPass = async rows => {
-    const compact = rows.map(t => JSON.stringify({ id: t.id, tier: t.tier, note: oneLine(t.note, '') }));
+    const byEvidence = new Map(candidates.map(q => [q.id, q]));
+    const compact = rows.map(t => JSON.stringify({ id: t.id, tier: t.tier, note: oneLine(t.note, ''),
+      evidence: byEvidence.has(t.id) ? JSON.parse(blockOf(byEvidence.get(t.id))) : null }));
     const merged = await runPiJson(header + compact.join('\n'), PYRAMID_WEIGH_MERGE_PROMPT);
     const changes = Array.isArray(merged.changes) ? merged.changes : Array.isArray(merged.tiers) ? merged.tiers : [];
     const byId = new Map(rows.map(t => [String(t.id), t]));
@@ -4973,6 +5033,9 @@ function renderPyramidIntentDoc(project, intent, quotes, tiers, builtAt, sourceH
       parts.push(`#### ${String(item.ts || '?').slice(0, 10)} — ${oneLine(item.title, '(untitled)')}`, '',
         `- **Kind:** ${item.kind} · **Force:** ${item.force || '?'}${t.note ? ` · **Weighing:** ${t.note}` : ''}`);
       if (item.situation) parts.push(`- **Situation:** ${item.situation}`);
+      if (appSettings.memoryImages) {
+        parts.push(`- **Branch:** ${item.offBranch ? 'off-branch alternative (not the active path)' : 'active path'} · **Entry:** ${item.entry || '?'} · **Preceding assistant:** ${item.assistantBeforeEntry || '(none)'}`);
+      }
       parts.push(`- **Session:** \`${item.key}\` · message #${item.messageIndex}`, '',
         quoteIntent(item.user), '');
     }
@@ -4987,6 +5050,7 @@ function pyramidIntentBlock(item, tierInfo) {
     `Date: ${item.ts || '?'}`,
     `Tier: ${tierInfo.tier}${tierInfo.note ? ' — ' + tierInfo.note : ''}`,
     `Kind: ${item.kind} · force: ${item.force || '?'} · situation: ${item.situation || '?'}`,
+    ...(appSettings.memoryImages ? [`Branch: ${item.offBranch ? 'off-branch alternative; not active-path intent' : 'active path'} · entry: ${item.entry || '?'} · preceding assistant entry: ${item.assistantBeforeEntry || '(none)'}`] : []),
     '', 'USER:', clipped(item.user, historical ? 1500 : 12000),
     ...(historical ? [] : ['', 'ASSISTANT BEFORE:', clipped(item.assistantBefore, 4000) || '(none)']),
   ].join('\n');
@@ -5082,18 +5146,21 @@ async function regenerateDocsCore({ label, entries, paths, existingEpics, discov
     `Abstract: ${r.leaf.abstract || '(none)'}`,
     (r.leaf.problems || []).some(p => p.state === 'open') ? `Open problems: ${(r.leaf.problems || []).filter(p => p.state === 'open').map(p => p.fact).join('; ')}` : '',
   ].filter(Boolean).join('\n'));
-  const intentSelected = rows.flatMap(r => (r.leaf.intent || []).map((q, i) => ({
-    id: r.key + ':' + q.messageIndex, key: r.key, messageIndex: q.messageIndex, ts: q.ts || r.leaf.span?.lastTs || null,
-    title: r.leaf.title, kind: q.kind || 'outcome', confidence: q.confidence || 0, reason: q.reason || '',
-    user: q.user || '', assistantBefore: q.assistantBefore || '',
-  }))).sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+  const intentSelected = appSettings.memoryImages
+    ? rows.flatMap(r => (r.leaf.intent || []).map(q => require('./memory-intent-evidence').intentEvidence(r.key, r.leaf, q)))
+      .sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')))
+    : rows.flatMap(r => (r.leaf.intent || []).map(q => ({
+      id: r.key + ':' + q.messageIndex, key: r.key, messageIndex: q.messageIndex, ts: q.ts || r.leaf.span?.lastTs || null,
+      title: r.leaf.title, kind: q.kind || 'outcome', confidence: q.confidence || 0, reason: q.reason || '',
+      user: q.user || '', assistantBefore: q.assistantBefore || '', force: q.force || '',
+    }))).sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
   const envFacts = rows.flatMap(r => (r.leaf.environment || []).map(f => `[${dated(r.leaf.span?.lastTs)}] ${f.type}: ${f.fact}`));
   const problemFacts = rows.flatMap(r => (r.leaf.problems || []).map(f => `[${dated(r.leaf.span?.lastTs)}] ${f.state}: ${f.fact} (session ${r.key})`));
   const newestAbstracts = rows.slice(-12).map(r => `[${dated(r.leaf.span?.lastTs)}] ${r.leaf.title}: ${r.leaf.abstract || '(none)'}`);
 
   const laneHashes = {
     overview: laneHashOf(abstractBlocks),
-    intent: laneHashOf(intentSelected.map(q => [q.id, q.force || '', q.kind])),
+    intent: appSettings.memoryImages ? laneHashOf(intentSelected) : laneHashOf(intentSelected.map(q => [q.id, q.force || '', q.kind])),
     environment: laneHashOf(envFacts), status: laneHashOf(problemFacts.concat(newestAbstracts)),
   };
   const skip = lane => prevHashes[lane] === laneHashes[lane] && fs.existsSync(paths[lane === 'status' ? 'status' : lane]);
@@ -5149,16 +5216,24 @@ async function regenerateDocsCore({ label, entries, paths, existingEpics, discov
   ]);
 
   emit('Writing project memory documents…', 5, 6);
+  const guard = () => {
+    memoryFeature.check();
+    if (appSettings.memoryImages && entries.some(({ key, entry }) => index[key] !== entry)) {
+      throw new Error('Document sources changed; result not published');
+    }
+  };
+  const write = (file, contents) => writeFileAtomic(file, contents, { guard });
+  guard();
   const builtAt = Date.now();
   const sourceHash = projectSourceHash({ entries });
   const candidates = discoverCandidates ? cleanEpicCandidates(profile, { entries, epics: existingEpics }) : [];
   await fsp.mkdir(paths.dir, { recursive: true });
   const writes = [];
-  if (!skip('overview')) writes.push(writeFileAtomic(paths.overview, renderPyramidOverviewDoc(project, profile, builtAt, sourceHash)));
-  if (intent) writes.push(writeFileAtomic(paths.intent, renderPyramidIntentDoc(project, intent, weighedQuotes, tiers, builtAt, sourceHash)));
-  if (environment) writes.push(writeFileAtomic(paths.environment, renderProjectEnvironmentDoc(project, environment, builtAt, sourceHash)));
-  if (status) writes.push(writeFileAtomic(paths.status, renderProjectStatusDoc(project, status, builtAt, sourceHash)));
-  writes.push(writeFileAtomic(inputsPath, JSON.stringify({
+  if (!skip('overview')) writes.push(write(paths.overview, renderPyramidOverviewDoc(project, profile, builtAt, sourceHash)));
+  if (intent) writes.push(write(paths.intent, renderPyramidIntentDoc(project, intent, weighedQuotes, tiers, builtAt, sourceHash)));
+  if (environment) writes.push(write(paths.environment, renderProjectEnvironmentDoc(project, environment, builtAt, sourceHash)));
+  if (status) writes.push(write(paths.status, renderProjectStatusDoc(project, status, builtAt, sourceHash)));
+  writes.push(write(inputsPath, JSON.stringify({
     project, builtAt, sourceHash, laneHashes, leaves: rows.map(r => ({ key: r.key, state: leafStateFor(r.entry, r.leaf) })),
     intentQuotes: intentSelected.length, weighedQuotes: weighedQuotes.length,
     tiers: [...tiers.entries()].map(([id, t]) => ({ id, ...t })),
@@ -5174,7 +5249,7 @@ async function regenerateDocsCore({ label, entries, paths, existingEpics, discov
     paths: { overview: paths.overview, intent: paths.intent, environment: paths.environment, status: paths.status, inputs: inputsPath },
     pyramid: { v: 2, builtAt, laneHashes, leafCount: rows.length, seededLeaves: rows.filter(r => r.leaf.partial).length },
   };
-  await writeFileAtomic(paths.manifest, JSON.stringify(manifest));
+  await write(paths.manifest, JSON.stringify(manifest));
   emit('Project memory saved.', 6, 6);
   return manifest;
 }
@@ -5253,7 +5328,14 @@ function projectMemoryIndex() {
 
 const oneLine = (s, fallback) => String(s || fallback).replace(/\s+/g, ' ').trim();
 
-async function buildEpicStory(evidenceInputs, focus, emit = () => {}) {
+async function buildEpicStory(evidenceInputs, focus, emit = () => {}, guard = () => {}) {
+  const call = async (input, prompt) => {
+    guard();
+    const raw = await runPi(input, prompt, null, { memory: true, guard });
+    guard();
+    return raw;
+  };
+  guard();
   const blocks = evidenceInputs.map(e => [
     `=== CONVERSATION ${e.key} ===`,
     `Date: ${e.firstTs || '?'} -> ${e.lastTs || '?'}`,
@@ -5264,7 +5346,7 @@ async function buildEpicStory(evidenceInputs, focus, emit = () => {}) {
   ].join('\n'));
   const budget = piTargetTokens() - 12000;
   if (estimateInputTokens(blocks.join('\n\n')) <= budget) {
-    return runPi(blocks.join('\n\n'), EPIC_PROMPT(focus));
+    return call(blocks.join('\n\n'), EPIC_PROMPT(focus));
   }
   // Very large epics get chronological chapter drafts first, then one final merge.
   const groups = [];
@@ -5276,11 +5358,12 @@ async function buildEpicStory(evidenceInputs, focus, emit = () => {}) {
   }
   if (group.length) groups.push(group);
   emit({ text: `Writing ${groups.length} epic timeline sections…` });
-  const drafts = await mapLimit(groups, 3, (items, i) => runPi(items.join('\n\n'),
+  const drafts = await mapLimit(groups, 3, (items, i) => call(items.join('\n\n'),
     EPIC_PROMPT(focus) + ` This is chronological evidence group ${i + 1} of ${groups.length}.`));
   const merged = drafts.map((text, i) => `=== TIMELINE DRAFT ${i + 1}/${drafts.length} ===\n${text}`).join('\n\n');
   if (estimateInputTokens(merged) > budget) throw new Error('Epic timeline drafts remain too large. Split this epic into smaller epics.');
-  return runPi(merged,
+  guard();
+  return call(merged,
     EPIC_PROMPT(focus) + ' The attached file contains chronological partial timeline drafts. Merge them into one timeline and preserve exact session ids.');
 }
 
@@ -5348,6 +5431,10 @@ async function buildEpic(ids, epicId = null, focus = '', assignedId = null, emit
   sessions.sort((a, b) => (a.firstTs || '').localeCompare(b.firstTs || ''));
   if (sessions.length < 2) throw new Error('could not read enough conversations');
   let evidenceDone = 0;
+  // Guards are live collaborators, not serializable provenance. Each completed
+  // input also fences the remaining builders' subcalls and correction retries.
+  const evidenceGuards = [];
+  const guard = () => { for (const check of evidenceGuards) check(); };
   emit({ text: 'Preparing conversation evidence…', done: 0, total: sessions.length + 1 });
   const evidenceInputs = await mapLimit(sessions, 3, async s => {
     const evidence = await epicEvidenceFor(s, detail => {
@@ -5358,17 +5445,22 @@ async function buildEpic(ids, epicId = null, focus = '', assignedId = null, emit
       } else if (detail.phase === 'retry-split') {
         emit({ text: `Model requested smaller input; retrying ${detail.sections} sections · evidence ${evidenceDone}/${sessions.length}…`, done: evidenceDone, total: sessions.length + 1 });
       }
-    });
+    }, false, guard);
+    if (evidence.guard) evidenceGuards.push(evidence.guard);
+    guard();
     emit({ text: `Preparing evidence ${++evidenceDone}/${sessions.length}…`, done: evidenceDone, total: sessions.length + 1 });
     return {
       key: s.key, title: s.title, cwd: s.cwd, firstTs: s.firstTs, lastTs: s.lastTs,
       source: evidence.source, kind: evidence.kind, outdated: evidence.outdated,
       notePath: evidence.notePath || null, hash: evidence.hash || null, text: evidence.text,
+      ...(evidence.sourceRevision ? { sourceRevision: evidence.sourceRevision } : {}),
     };
   });
+  guard();
   emit({ text: 'Writing the cross-session timeline…', done: sessions.length, total: sessions.length + 1 });
   const raw = await buildEpicStory(evidenceInputs, focus || (old && old.title) || '', progress =>
-    emit({ ...progress, done: sessions.length, total: sessions.length + 1 }));
+    emit({ ...progress, done: sessions.length, total: sessions.length + 1 }), guard);
+  guard();
   const story = JSON.parse(raw.replace(/^```(json)?\s*|\s*```$/g, ''));
   if (!Array.isArray(story.chapters) || !story.chapters.length) throw new Error('the epic narrative had no timeline');
   const id = (old && old.id) || assignedId || crypto.randomUUID();
@@ -5385,10 +5477,24 @@ async function buildEpic(ids, epicId = null, focus = '', assignedId = null, emit
     notePath: epicPathFor(id),
   };
   const text = renderEpicMarkdown(epic, story, sessions);
-  await fsp.writeFile(epic.notePath, text);
-  await fsp.writeFile(epicInputsPathFor(id), JSON.stringify({ epicId: id, builtAt: now, inputs: evidenceInputs }));
+  // Separate durable atomic files, NOT a transaction: a later failure retains
+  // earlier files for explicit recovery, but never labels the build complete.
+  const publish = async (file, content) => {
+    guard();
+    await writeFileAtomic(file, content, { guard, sync: true, syncDirectory: true });
+    guard();
+  };
+  await publish(epic.notePath, text);
+  await publish(epicInputsPathFor(id), JSON.stringify({ epicId: id, builtAt: now, inputs: evidenceInputs }));
+  guard();
+  const beforeEpics = JSON.stringify(epics);
+  const publicationGuard = () => {
+    guard();
+    if (JSON.stringify(epics) !== beforeEpics) throw new Error('Epics changed during publication');
+  };
+  await saveEpics({ guard: publicationGuard, value: { ...epics, [id]: epic } });
+  publicationGuard();
   epics[id] = epic;
-  saveEpics();
   emit({ text: 'Epic saved.', done: sessions.length + 1, total: sessions.length + 1 });
   return { ...epic, text, sessions: sessions.map(s => ({ key: s.key, title: s.title, firstTs: s.firstTs, cwd: s.cwd })) };
 }
@@ -5659,7 +5765,7 @@ function startDocsJobCore(mapKey, title, project, epicId, run, options = {}) {
   };
   memoryDocsJobs.set(mapKey, job);
   jobChanged(job);
-  job.completion = modelCallContext.run({ automatic: !!options.automatic }, async () => {
+  job.completion = modelCallContext.run({ automatic: !!options.automatic, memory: true }, async () => {
     try {
       const manifest = await run((text, done, total) => {
         job.statusText = text; job.done = done; job.total = total; jobChanged(job);
@@ -5770,6 +5876,8 @@ const leafDirty = new Map(); // key -> last content change (ms)
 
 function markLeafDirty(key, prevEntry, entry, mtimeMs) {
   if (!entry || !entry.realUserCount) return;
+  if (prevEntry && entry.sourceRevision && prevEntry.sourceRevision === entry.sourceRevision) return;
+  if (prevEntry && !!prevEntry.memoryImages !== !!entry.memoryImages && prevEntry.mtimeMs === entry.mtimeMs && prevEntry.size === entry.size) return;
   if (prevEntry && prevEntry.memoryHash === entry.memoryHash) return; // re-index without content change
   if (!prevEntry && Date.now() - (mtimeMs || 0) > 24 * 60 * 60 * 1000) return; // old file first seen (cache bump / backfill territory)
   leafDirty.set(key, Date.now());
@@ -12694,12 +12802,27 @@ const server = http.createServer(async (req, res) => {
       const parsed = JSON.parse(body || '{}');
       const piDefault = readPiDefault();
       const listed = (modelsCache.models.length ? modelsCache : await listPiModels()).models;
-      if (!parsed.usePiDefault && parsed.provider && parsed.model && listed.length && !settingsLib.findModel(listed, parsed.provider, parsed.model)) {
-        return json(res, 400, { error: 'unknown model: ' + parsed.provider + '/' + parsed.model });
-      }
       const prevSemTarget = (appSettings.semanticUrl || '') + '|' + semNs();
-      appSettings = settingsLib.applyResolvedContext(parsed, listed, piDefault);
+      // Partial updates must preserve omitted fields: a settings pane that does
+      // not know about a knob cannot silently reset it.
+      const nextSettings = settingsLib.applyResolvedContext({ ...appSettings, ...parsed }, listed, piDefault);
+      if (!parsed.usePiDefault && parsed.provider && parsed.model && listed.length && !settingsLib.findModel(listed, parsed.provider, parsed.model)) {
+        // A provider reached through a trusted entrypoint, or declared in pi's
+        // static models.json, need not appear in the cached catalog. Exact
+        // runtime resolution still rejects a bad id, with no fallback.
+        const extensions = (parsed.providerExtensions !== undefined ? parsed.providerExtensions : appSettings.providerExtensions) || {};
+        const trusted = Array.isArray(extensions[parsed.provider]) && extensions[parsed.provider].length;
+        let staticHit = false;
+        try {
+          const models = JSON.parse(fs.readFileSync(PI_MODELS_FILE, 'utf8'));
+          staticHit = (models.providers?.[parsed.provider]?.models || []).some(m => m && m.id === parsed.model);
+        } catch {}
+        if (!trusted && !staticHit) return json(res, 400, { error: 'unknown model: ' + parsed.provider + '/' + parsed.model });
+      }
+      if (nextSettings.memoryImages && nextSettings.usePiDefault) return json(res, 400, { error: 'Image memory requires an explicit provider/model' });
+      appSettings = nextSettings;
       saveAppSettings();
+      modelsCache.at = 0; // explicit provider-entrypoint changes invalidate the catalog view
       memoryModelHealth.setIdentity(currentModelLabel());
       // A new URL or namespace means a different remote index: re-push all.
       if (searchIdx && (appSettings.semanticUrl || '') + '|' + semNs() !== prevSemTarget) {
