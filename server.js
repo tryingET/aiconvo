@@ -709,6 +709,7 @@ async function indexFile(source, relPath, stat) {
     await writeFileAtomic(cachePathFor(key), JSON.stringify({ key, relPath, ...entry, messages, entryParents }));
     saveIndexSoon();
     broadcast({ type: 'update', key, ...entry, project: projectNameOf(entry.cwd, key) });
+    if (snapshot) memoryFeature.observe(key, snapshot.revision);
     markLeafDirty(key, prev, entry, stat.mtimeMs);
     if (searchIdx) {
       try {
@@ -848,50 +849,18 @@ function reindexIfChanged(key) {
 // vanish drop theirs. Files already inside a newly watched directory are
 // handed to onFile once (the scheduler skips unchanged bytes).
 function watchTree(baseDir, onFile) {
-  const watchers = new Map(); // absolute directory → FSWatcher
-  const remove = dir => {
-    for (const [d, w] of watchers) {
-      if (d === dir || d.startsWith(dir + path.sep)) { w.close(); watchers.delete(d); }
-    }
-  };
-  const add = dir => {
-    if (watchers.has(dir)) return;
-    let w;
-    try {
-      w = fs.watch(dir, (event, name) => {
-        if (!name) return;
-        const abs = path.join(dir, name);
-        const rel = path.relative(baseDir, abs);
-        if (isMainTranscript(rel)) { onFile(rel); return; }
-        // Only a rename (create, delete, move) can change the directory set.
-        if (event !== 'rename') return;
-        fs.stat(abs, (err, st) => {
-          if (err) { if (watchers.has(abs)) remove(abs); return; }
-          if (st.isDirectory()) add(abs);
-        });
-      });
-    } catch (e) { console.error('watch failed:', dir, e.message); return; }
-    w.on('error', () => remove(dir));
-    watchers.set(dir, w);
-    fs.readdir(dir, { withFileTypes: true }, (err, entries) => {
-      if (err) return;
-      for (const e of entries) {
-        const abs = path.join(dir, e.name);
-        if (e.isDirectory()) add(abs);
-        else if (e.isFile()) { const rel = path.relative(baseDir, abs); if (isMainTranscript(rel)) onFile(rel); }
-      }
-    });
-  };
-  add(baseDir);
-  return { close: () => remove(baseDir), count: () => watchers.size };
+  return require('./source-watcher').watchTree(baseDir, onFile, isMainTranscript);
 }
-
 // Watcher: re-index a file shortly after it changes.
 const treeWatchers = new Map(); // source → watchTree handle
 function watch() {
   for (const [source, baseDir] of Object.entries(SOURCES)) {
     if (!fs.existsSync(baseDir)) continue;
-    treeWatchers.set(source, watchTree(baseDir, rel => scheduleIndex(source + ':' + rel)));
+    treeWatchers.set(source, watchTree(baseDir, (rel, observation) => {
+      const key = source + ':' + rel;
+      memoryFeature.created(key, observation);
+      scheduleIndex(key);
+    }));
     console.log('watching', baseDir);
   }
   setInterval(() => { sweepIndexDrift().catch(e => console.error('drift sweep failed:', e.message)); }, DRIFT_SWEEP_MS);
@@ -2905,7 +2874,7 @@ async function assignConversationProject(key, rawProject) {
   // regenerates the new project's documents (and any epics) when it lands.
   // Without a leaf there is nothing to re-weigh: the backfill builds it later.
   let reextract = false;
-  if (project !== oldProject && index[key].realUserCount && await readLeaf(key)) {
+  if (memoryFeature.legacyAllowed() && project !== oldProject && index[key].realUserCount && await readLeaf(key)) {
     try {
       startMemoryExtractJob([key], `${oneLine(index[key].title, '(untitled)').slice(0, 60)}: re-read for ${project}`, { automatic: true });
       reextract = true;
@@ -3553,10 +3522,44 @@ function saveAppSettings() {
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings, null, 2) + '\n', { mode: 0o600 });
 }
 const memoryFeature = createMemoryFeature({
+  stateFile: path.join(path.dirname(SETTINGS_FILE), 'memory-automation.json'),
   settings: () => appSettings, context: modelCallContext, parseFile,
   sourceFile: absPathForKey,
   projectOf: key => projectNameOf(index[key]?.cwd, key),
   claudeCodeExtension: () => fs.existsSync(CLAUDE_CODE_EXT) ? CLAUDE_CODE_EXT : '',
+  async *sources() {
+    for (const [source, base] of Object.entries(SOURCES)) for await (const rel of walk(base, base)) {
+      if (isMainTranscript(rel)) yield { key: source + ':' + rel, file: path.join(base, rel) };
+    }
+  },
+  data: async key => JSON.parse(await fsp.readFile(cachePathFor(key), 'utf8')),
+  canRun: key => !!index[key] && !activeMemoryLeafKeys.has(key) && (!distillJobs.has(key) || distillJobs.get(key).finished),
+  reserve: (key, yes) => yes ? activeMemoryLeafKeys.add(key) : activeMemoryLeafKeys.delete(key),
+  async publish(key, data, built) {
+    const guard = () => { memoryFeature.check(); built.guard(); };
+    const file = index[key].notePath || noteFileFor(data, data.title);
+    await fsp.mkdir(NOTES_DIR, { recursive: true });
+    await fsp.mkdir(MEMORY_LEAVES_DIR, { recursive: true });
+    await writeFileAtomic(file, built.note, { guard, sync: true, syncDirectory: true });
+    await writeFileAtomic(leafPathFor(key), JSON.stringify(built.leaf), { guard, sync: true, syncDirectory: true });
+    guard();
+    memoryLeafCache.delete(key);
+    index[key].notePath = file; index[key].notedAt = index[key].mtimeMs;
+    saveIndexSoon();
+    broadcast({ type: 'update', key, ...index[key], project: projectNameOf(index[key].cwd, key) });
+  },
+  async documents(key) {
+    const project = projectNameOf(index[key]?.cwd, key);
+    if (projectMetaFor(project) && fs.existsSync(projectMemoryPaths(project).manifest)) await regenerateProjectDocs(project);
+    for (const rel of Object.keys(declaredAreasFor(project))) {
+      if (fs.existsSync(areaMemoryPaths(project, rel).manifest)) await regenerateAreaDocs(project, rel);
+    }
+    for (const epic of Object.values(epics)) {
+      if (epic.sessionIds?.includes(key) && fs.existsSync(epicMemoryPaths(epic.id).manifest)) await regenerateEpicDocs(epic.id);
+    }
+  },
+  changed: () => broadcast({ type: 'memory-automation', state: memoryFeature.status() }),
+  error: (key, e) => console.error('automatic memory:', key, e.message),
   usage(message) {
     if (!message.usage) return;
     const record = { type: 'message', id: crypto.randomUUID(), parentId: null,
@@ -3733,6 +3736,7 @@ function settingsResponse() {
   const piDefault = readPiDefault();
   return {
     settings: appSettings,
+    memoryAutomation: memoryFeature.status(),
     resolved: {
       provider: appSettings.usePiDefault ? piDefault.provider : appSettings.provider,
       model: appSettings.usePiDefault ? piDefault.model : appSettings.model,
@@ -3840,6 +3844,9 @@ async function runPi(fileContent, prompt, onChunk, options = {}) {
   guard();
   if (!appSettings.aiTitles && [TITLE_PROMPT, RETITLE_PROMPT, PROJECT_RETITLE_PROMPT, TIMELINE_TITLE_PROMPT, DOC_COMMIT_TITLE_PROMPT].includes(prompt)) requireAiTitles();
   const route = memoryFeature.routeCall({ text: fileContent, images: [] }, prompt, { ...options, onChunk });
+  const auto = route.automatic, callEpoch = route.epoch;
+  const memoryCall = route.modelOnly || !!modelCallContext.getStore()?.ticket || options.memory === true;
+  if (memoryCall && auto && !memoryFeature.automaticAllowed()) throw new Error('Automatic memory calls are disabled by memory policy');
   if (route.modelOnly) {
     const result = await route.invoke();
     guard();
@@ -3876,6 +3883,7 @@ async function runPi(fileContent, prompt, onChunk, options = {}) {
       },
     );
     guard();
+    if (memoryCall && auto && (memoryFeature.epoch() !== callEpoch || !memoryFeature.automaticAllowed())) throw new Error('Automatic memory consent changed during the model call');
     memoryModelHealth.success(permit);
 
     // JSON mode gives the final provider usage. These no-session calls were
@@ -5218,11 +5226,12 @@ async function regenerateDocsCore({ label, entries, paths, existingEpics, discov
   emit('Writing project memory documents…', 5, 6);
   const guard = () => {
     memoryFeature.check();
-    if (appSettings.memoryImages && entries.some(({ key, entry }) => index[key] !== entry)) {
+    if ((appSettings.memoryImages || modelCallContext.getStore()?.ticket) && entries.some(({ key, entry }) => index[key] !== entry)) {
       throw new Error('Document sources changed; result not published');
     }
   };
-  const write = (file, contents) => writeFileAtomic(file, contents, { guard });
+  const durable = !!modelCallContext.getStore()?.ticket;
+  const write = (file, contents) => writeFileAtomic(file, contents, { guard, sync: durable, syncDirectory: durable });
   guard();
   const builtAt = Date.now();
   const sourceHash = projectSourceHash({ entries });
@@ -5678,6 +5687,7 @@ function startDistillJob(key, data, options = {}) {
 // and a manual action from writing the same leaf at the same time.
 function startMemoryExtractJob(ids, label = null, options = {}) {
   const automatic = !!options.automatic;
+  if (automatic && !memoryFeature.legacyAllowed()) throw new Error('Legacy automatic extraction is disabled');
   const keys = [...new Set(ids)].filter(k => index[k] && !activeMemoryLeafKeys.has(k) && memoryModelHealth.canRunLeaf(k, { automatic }));
   if (!keys.length) throw new Error('no memory leaves are ready to extract');
   const id = crypto.randomUUID();
@@ -5698,7 +5708,7 @@ function startMemoryExtractJob(ids, label = null, options = {}) {
     const savedKeys = [];
     await mapLimit(keys, 2, async key => {
       try {
-        await modelCallContext.run({ automatic }, () => extractLeaf(key));
+        await modelCallContext.run({ automatic, epoch: memoryFeature.epoch() }, () => extractLeaf(key));
         memoryModelHealth.leafSuccess(key);
         savedKeys.push(key);
         const entry = index[key];
@@ -5756,6 +5766,7 @@ function startEpicDocsJob(epicId, options = {}) {
 }
 
 function startDocsJobCore(mapKey, title, project, epicId, run, options = {}) {
+  if (options.automatic && !memoryFeature.automaticAllowed()) throw new Error('Automatic document work is disabled');
   const running = memoryDocsJobs.get(mapKey);
   if (running && !running.finished) return running;
   const job = {
@@ -5765,7 +5776,7 @@ function startDocsJobCore(mapKey, title, project, epicId, run, options = {}) {
   };
   memoryDocsJobs.set(mapKey, job);
   jobChanged(job);
-  job.completion = modelCallContext.run({ automatic: !!options.automatic, memory: true }, async () => {
+  job.completion = modelCallContext.run({ automatic: !!options.automatic, memory: true, epoch: memoryFeature.epoch() }, async () => {
     try {
       const manifest = await run((text, done, total) => {
         job.statusText = text; job.done = done; job.total = total; jobChanged(job);
@@ -5875,6 +5886,7 @@ const LEAF_SWEEP_MS = 2 * 60 * 1000;
 const leafDirty = new Map(); // key -> last content change (ms)
 
 function markLeafDirty(key, prevEntry, entry, mtimeMs) {
+  if (!memoryFeature.legacyAllowed()) return;
   if (!entry || !entry.realUserCount) return;
   if (prevEntry && entry.sourceRevision && prevEntry.sourceRevision === entry.sourceRevision) return;
   if (prevEntry && !!prevEntry.memoryImages !== !!entry.memoryImages && prevEntry.mtimeMs === entry.mtimeMs && prevEntry.size === entry.size) return;
@@ -5884,6 +5896,8 @@ function markLeafDirty(key, prevEntry, entry, mtimeMs) {
 }
 
 async function sweepSettledLeaves() {
+  if (appSettings.automaticMemory === 'changes-after-enable') return memoryFeature.sweep(LEAF_SETTLE_MS);
+  if (!memoryFeature.legacyAllowed()) return;
   // Keep dirty work queued while the circuit is open. After the cooldown, one
   // call becomes the half-open probe; the health gate blocks all other calls.
   if (memoryModelHealth.isAutomaticPaused()) return;
@@ -5923,6 +5937,7 @@ function modelAutomaticRetryDelay() {
   return Math.max(LEAF_SWEEP_MS, memoryModelHealth.automaticWaitMs() + 1000);
 }
 function scheduleDocsRegen(project, delayMs = DOCS_REGEN_DEBOUNCE_MS) {
+  if (!memoryFeature.legacyAllowed()) return;
   if (!project || project === '?') return;
   clearTimeout(docsRegenTimers.get(project));
   docsRegenTimers.set(project, setTimeout(() => {
@@ -5965,6 +5980,7 @@ function scheduleDocsRegen(project, delayMs = DOCS_REGEN_DEBOUNCE_MS) {
 // current on the same settle -> leaf -> debounced-docs path. Epics never
 // create themselves; only already-built epic memory refreshes.
 function scheduleEpicRegenForKeys(keys, delayMs = DOCS_REGEN_DEBOUNCE_MS) {
+  if (!memoryFeature.legacyAllowed()) return;
   const touched = new Set(keys);
   for (const epic of Object.values(epics)) {
     if (!epic || !epic.id) continue;
@@ -11750,6 +11766,7 @@ const server = http.createServer(async (req, res) => {
     const staticFile = {
       '/sw.js': { file: 'sw.js', type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
       '/context-panel.js': { file: 'context-panel.js', type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
+      '/memory-settings.js': { file: 'memory-settings.js', type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
       '/file-completion-ui.js': { file: 'file-completion-ui.js', type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
       '/linediff.js': { file: 'linediff.js', type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
       '/delegation-ui.js': { file: 'delegation-ui.js', type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
@@ -12781,6 +12798,10 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, { usageBilling: appSettings.usageBilling });
     } else if (u.pathname === '/api/settings' && req.method === 'GET') {
       json(res, 200, settingsResponse());
+    } else if (u.pathname === '/api/memory/automation/discard' && req.method === 'POST') {
+      let body = ''; for await (const chunk of req) body += chunk;
+      memoryFeature.discard(JSON.parse(body || '{}').key);
+      json(res, 200, settingsResponse());
     } else if (u.pathname === '/api/machines/connect' && req.method === 'POST') {
       let body = '';
       for await (const chunk of req) body += chunk;
@@ -12820,6 +12841,7 @@ const server = http.createServer(async (req, res) => {
         if (!trusted && !staticHit) return json(res, 400, { error: 'unknown model: ' + parsed.provider + '/' + parsed.model });
       }
       if (nextSettings.memoryImages && nextSettings.usePiDefault) return json(res, 400, { error: 'Image memory requires an explicit provider/model' });
+      await memoryFeature.configure(nextSettings);
       appSettings = nextSettings;
       saveAppSettings();
       modelsCache.at = 0; // explicit provider-entrypoint changes invalidate the catalog view

@@ -2,6 +2,7 @@
 
 const os = require('os');
 const path = require('path');
+const AUTOMATIC_MEMORY_MODES = ['legacy', 'off', 'changes-after-enable'];
 
 const DEFAULT_CONTEXT_TOKENS = 272000;
 
@@ -24,6 +25,7 @@ const DEFAULT_SETTINGS = {
   providerExtensions: {},
   aiTitles: true,
   memoryImages: false,
+  automaticMemory: 'legacy',
   provider: 'openai-codex',
   model: 'gpt-5.6-sol',
   thinking: 'off',
@@ -187,11 +189,13 @@ function normalizeProviderExtensions(raw) {
 
 function normalizeSettings(input) {
   const src = input && typeof input === 'object' ? input : {};
+  if (src.automaticMemory !== undefined && !AUTOMATIC_MEMORY_MODES.includes(src.automaticMemory)) throw new Error('Invalid automaticMemory policy');
   for (const key of ['aiTitles', 'memoryImages']) if (src[key] !== undefined && typeof src[key] !== 'boolean') throw new Error(key + ' must be a boolean');
   const memory = {
     providerExtensions: normalizeProviderExtensions(src.providerExtensions),
     aiTitles: src.aiTitles !== false,
     memoryImages: src.memoryImages === true,
+    automaticMemory: AUTOMATIC_MEMORY_MODES.includes(src.automaticMemory) ? src.automaticMemory : 'legacy',
   };
   const thinking = THINKING_LEVELS.includes(src.thinking) ? src.thinking : DEFAULT_SETTINGS.thinking;
   const provider = String(src.provider || '').trim();
@@ -293,6 +297,7 @@ function applyResolvedContext(settings, models, piDefault) {
 module.exports = {
   DEFAULT_CONTEXT_TOKENS,
   DEFAULT_SETTINGS,
+  AUTOMATIC_MEMORY_MODES,
   normalizeProviderExtensions,
   THINKING_LEVELS,
   DONE_SOUND_MODES,

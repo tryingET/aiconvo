@@ -22,14 +22,16 @@ test('image-bearing leaf freshness binds raw source, image mode and selected-mod
   context.appSettings.memoryImages = false; assert.equal(state(entry, leaf), 'stale');
 });
 
-test('a mode/cache re-index is not a content change; image-byte changes still invalidate', () => {
-  const dirty = new Map(), context = { leafDirty: dirty, Date };
+test('a mode/cache re-index is not a legacy historical-inference trigger; image-byte changes still invalidate', () => {
+  const dirty = new Map(), context = { leafDirty: dirty, memoryFeature: { legacyAllowed: () => true }, Date };
   const mark = load('markLeafDirty', context);
   const previous = { memoryHash: 'text-hash', memoryImages: false, mtimeMs: 10, size: 100, realUserCount: 1 };
   const images = { ...previous, memoryHash: 'image-hash', memoryImages: true, sourceRevision: 'a' };
   mark('session', previous, images, 10); assert.equal(dirty.size, 0);
   mark('session', images, { ...images, memoryHash: 'model-mode-hash' }, 10); assert.equal(dirty.size, 0);
   mark('session', images, { ...images, sourceRevision: 'b', memoryHash: 'new-image-hash' }, 10); assert.equal(dirty.size, 1);
+  dirty.clear(); context.memoryFeature.legacyAllowed = () => false;
+  mark('session', images, { ...images, sourceRevision: 'c', memoryHash: 'third' }, 10); assert.equal(dirty.size, 0);
 });
 
 test('deterministic title-off note paths distinguish same-date, same-title sessions', () => {
