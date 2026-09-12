@@ -475,7 +475,10 @@ function isNoise(text) {
   );
 }
 
-async function parseFile(absPath) {
+// sourceText parses an already captured snapshot instead of re-reading the
+// file, so attachment references and text come from the same bytes. Passing
+// null keeps the existing streaming read.
+async function parseFile(absPath, sourceText = null) {
   const messages = [];
   let meta = { sessionId: null, cwd: null, gitBranch: null, firstTs: null, lastTs: null, rootId: null, parentSession: null };
   // Branch awareness: both formats store a real entry tree (pi: id/parentId,
@@ -486,8 +489,9 @@ async function parseFile(absPath) {
   // they get off:true so the transcript can fold them.
   const parents = new Map();
   let leafId = null;
-  const stream = fs.createReadStream(absPath, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const rl = sourceText === null
+    ? readline.createInterface({ input: fs.createReadStream(absPath, { encoding: 'utf8' }), crlfDelay: Infinity })
+    : sourceText.split('\n');
   for await (const line of rl) {
     if (!line) continue;
     let d;
