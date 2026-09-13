@@ -5,7 +5,10 @@
 // on the next load and a plain reload never re-downloads 1–4 MB.
 // Everything else goes straight to the network: the app's own freshness
 // rules (ETag + no-cache) stay with the server.
-const VENDOR_CACHE = 'aiconvo-vendor-v1';
+// v2 (2026-09-13): a checkout swap can serve a transient/garbled bundle under
+// the same versioned URL; stale-while-revalidate then keeps serving it. Bumping
+// the cache name drops every stored entry on the next service-worker update.
+const VENDOR_CACHE = 'aiconvo-vendor-v2';
 
 self.addEventListener('install', event => {
   event.waitUntil(self.skipWaiting());
