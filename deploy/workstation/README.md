@@ -18,7 +18,10 @@
 - `~/.local/share/applications/aiconvo.desktop` links to the adjacent launcher.
 - Service enabled at user login; no linger setting was changed. No automatic restart loop.
 - Node: `/usr/bin/node`, verified with v26.8.1; upstream requires modern Node with `node:sqlite`.
-- Service memory high/max: 768 MiB / 1 GiB. An OOM must be investigated before expanding limits.
+- Service memory high/max: 10% / 20% of total RAM, set as percentages in the tracked
+  unit (systemd ≥ 242 resolves them per machine; ~6.2 / 12.5 GiB here). Absolute
+  limits were replaced 2026-09-13 after the incident below; overrides use a
+  drop-in (`systemctl --user edit aiconvo`).
 - Cache: `~/.cache/aiconvo-all-sessions`; temporary files: `~/.local/state/aiconvo/tmp`.
   The old `~/.cache/aiconvo-compass-pilot` index is retained, not merged or deleted.
 - Default upstream durable data paths remain under `~/.local/share/aiconvo` and `~/notes/aiconvo`.
@@ -109,6 +112,23 @@ Exact isolated invocation: `/home/tryinget/.local/state/pi-quests/tmp/a.VTZUU9/i
 Independent review found and reproduced the scratch-failure retry problem and
 repair-utility cache mismatch; both were corrected before the final suite.
 No automatic provider inference or live manual inference test was performed.
+
+## Memory limits: percentages, not absolutes (2026-09-13)
+
+The absolute 768 MiB / 1 GiB limits caused a failure that looked like a hang: the
+node server peaked near the 1 GiB cap while the cgroup churned ~6.8 GiB through
+swap (14¾ h uptime, 4 d CPU). Under `MemoryHigh` pressure the kernel reclaims
+via swap long before any OOM kill, so the service answered slowly and every
+agent run on it looked "stuck"; each operator restart then SIGKILLed the warm
+`pi` children mid-run (KillMode=mixed kills the whole cgroup), producing aborted
+turns and re-parented retries in the session trees.
+
+The tracked unit now sets `MemoryHigh=10%` / `MemoryMax=20%` — resolved by systemd
+against total RAM (verified live: 6,687,948,800 / 13,375,901,696 bytes on this
+62 GiB machine, applied by daemon-reload without a restart). Same protection
+ratio on every deploy target; no per-machine tuning. Overrides remain a plain
+drop-in. The generated unit in upstream `setup.sh` received the same limits
+(PR: adaptive memory limits).
 
 ## Initial installation verification (2026-09-12)
 
