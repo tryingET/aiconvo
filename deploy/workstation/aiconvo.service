@@ -18,8 +18,13 @@ Environment=AICONVO_NO_LEDGER=1
 Environment=AICONVO_NO_FILE_HISTORY=1
 Environment=AICONVO_NO_CHECKPOINTS=1
 UMask=0077
-MemoryHigh=768M
-MemoryMax=1G
+# Memory limits scale with the machine: percentages of total RAM (systemd >= 242),
+# so a 62 GB workstation gets ~6 GB/12 GB headroom while an 8 GB WSL2 laptop keeps
+# the same protection ratio (~800 MB/1.6 GB). Absolute limits tuned on one machine
+# caused swap thrash on smaller ones long before any OOM kill. Override locally
+# with a drop-in: systemctl --user edit aiconvo
+MemoryHigh=10%
+MemoryMax=20%
 KillMode=mixed
 TimeoutStopSec=15
 Restart=no
