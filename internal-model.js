@@ -1,11 +1,10 @@
 'use strict';
 const fs = require('node:fs/promises');
-const fsSync = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const processes = require('./processes');
+const { createProcessOwner } = require('./memory-process-owner');
 const { memoryConfig } = require('./memory-config');
 const { decodeImage, LIMITS } = require('./memory-images');
 const DEFAULT_PACKAGE = path.join(__dirname, 'runtime/node_modules/@earendil-works/pi-coding-agent');
@@ -90,60 +89,31 @@ async function runInternalModel(request, options = {}) {
 function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onThinking }) {
   return new Promise((resolve, reject) => {
     let child, anchor = null, result = null, failure = null, terminal = false, invoked = false, size = 0;
-    let chain = Promise.resolve(), owned = [], killOK = false, escalation = null, cleanupDeadline = null;
-    const same = (a, b) => a && b && a.pid === b.pid && a.start === b.start && a.boot === b.boot;
-    // Signal only identities proven to descend from this live supervisor. In
-    // particular, a detached provider child is owned but has a different PGID.
-    const signalOwned = signal => {
-      for (const id of owned) {
-        try {
-          const current = processes.identity(id.pid);
-          if (!same(current, id)) continue; // exited or reused: never signal the replacement
-          try { process.kill(id.pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; }
-        } catch { killOK = false; }
-      }
-    };
+    let chain = Promise.resolve(), killOK = false, escalation = null, cleanupDeadline = null, deadline = Infinity;
+    const owner = createProcessOwner();
+    const signalOwned = signal => { if (!owner.signal(signal, deadline)) killOK = false; };
     const stop = error => {
       if (terminal) return;
       terminal = true; failure = error || null;
       if (!child?.pid) return;
+      deadline = Date.now() + 4000;
       cleanupDeadline = setTimeout(() => {
         clearTimeout(timer); signal?.removeEventListener('abort', abort);
         reject(Object.assign(new Error('Memory tree cleanup not established; temporary state retained'), { retainTemporaryState: true }));
       }, 4000);
       try {
-        const table = processes.list();
-        if (process.platform === 'linux') {
-          if (!same(processes.identity(child.pid), anchor) || !table.some(p => p.pid === child.pid)) throw new Error('Live supervisor ownership unavailable');
-          const parents = new Map([[child.pid, anchor]]);
-          // Bind the current parent chain, not just stale PIDs in a process-table
-          // snapshot. Capture parents first; signal their children first.
-          for (const pid of processes.descendantsOf(table, child.pid).reverse()) {
-            if (pid === child.pid) continue;
-            const id = processes.identity(pid);
-            if (!id) continue;
-            let fields;
-            try { const stat = fsSync.readFileSync('/proc/' + pid + '/stat', 'utf8'); fields = stat.slice(stat.lastIndexOf(')') + 2).split(' '); }
-            catch (e) { if (['ENOENT', 'ESRCH'].includes(e.code)) continue; throw e; }
-            const ppid = table.find(p => p.pid === pid)?.ppid, parent = parents.get(ppid);
-            if (fields[19] !== id.start || Number(fields[1]) !== ppid || !same(processes.identity(ppid), parent)) throw new Error('Descendant ownership changed during capture');
-            parents.set(pid, id); owned.unshift(id);
-          }
-          killOK = true;
-          signalOwned('SIGTERM');
-          escalation = setTimeout(() => signalOwned('SIGKILL'), 150);
-        } else {
-          owned = processes.descendantsOf(table, child.pid).map(pid => processes.identity(pid)).filter(Boolean);
-          killOK = processes.stopTree(child.pid, 'SIGKILL');
-        }
-      } catch { killOK = false; failure = new Error('Memory worker cleanup failed'); if (process.platform === 'linux') signalOwned('SIGKILL'); }
+        owner.capture(anchor, deadline);
+        killOK = true;
+        signalOwned('SIGTERM');
+        escalation = setTimeout(() => signalOwned('SIGKILL'), 150);
+      } catch { killOK = false; failure = new Error('Memory worker cleanup failed'); signalOwned('SIGKILL'); }
     };
     const abort = () => stop(stopped());
     const timer = setTimeout(() => stop(Object.assign(new Error('Memory model deadline exceeded; no replay'), { modelCallFailure: invoked })), timeoutMs);
     try {
       child = spawn(process.execPath, [path.join(__dirname, 'internal-model-supervisor.js'), path.join(__dirname, 'internal-model-worker.js')],
         { cwd, env, detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
-      if (process.platform === 'linux') { try { anchor = processes.identity(child.pid); } catch {} if (anchor) owned.push(anchor); }
+      try { anchor = owner.anchor(child.pid); } catch {}
     } catch (e) { clearTimeout(timer); reject(e); return; }
     const send = packet => { if (child.connected) child.send(packet, e => { if (e) stop(e); }); else stop(new Error('Memory IPC disconnected')); };
     child.on('message', packet => {
@@ -165,24 +135,17 @@ function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onTh
     child.once('close', async () => {
       clearTimeout(timer); clearTimeout(escalation); signal?.removeEventListener('abort', abort);
       await chain;
-      // Unix: group remains identifiable after the anchor exits. Windows:
-      // taskkill /T is the platform primitive; check captured identities too.
-      const alive = () => {
-        const capturedAlive = owned.some(id => same(processes.identity(id.pid), id));
-        if (process.platform !== 'win32' && child.pid) {
-          return capturedAlive || processes.list().some(p => processes.identity(p.pid)?.pgrp === child.pid);
-        }
-        return capturedAlive;
-      };
+      const alive = () => owner.alive(anchor);
       let clean = false;
       try {
         for (let i = 0; i < 30; i++) {
-          if (process.platform === 'linux' && [0, 5, 15].includes(i)) signalOwned('SIGKILL');
+          if (Date.now() > deadline) break;
+          if ([0, 5, 15].includes(i)) signalOwned('SIGKILL');
           if (!alive()) { clean = true; break; }
           await new Promise(r => setTimeout(r, 100));
         }
       } catch {}
-      if (child.pid && (!terminal || !killOK || !processes.reliable || !clean)) {
+      if (child.pid && (!terminal || !killOK || !clean)) {
         failure = Object.assign(new Error('Memory tree cleanup not established; temporary state retained'), { retainTemporaryState: true });
       }
       clearTimeout(cleanupDeadline);
@@ -193,7 +156,7 @@ function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onTh
     signal?.addEventListener('abort', abort, { once: true });
     chain = chain.then(async () => {
       await check();
-      if (process.platform === 'linux' && !anchor) stop(new Error('Supervisor identity unavailable'));
+      if (!anchor) stop(new Error('Supervisor identity unavailable'));
       else if (signal?.aborted) abort();
       else if (!terminal) send({ type: 'prepare', ...request });
     }).catch(stop);

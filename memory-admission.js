@@ -7,7 +7,19 @@ const { revision } = require('./memory-identity');
 // keeps the admitted claims across awaits; replacing a manifest cannot authorize
 // bytes already read from the preceding generation. Canonical aliases share ACLs.
 function createMemoryAdmission({ notesDir, cacheDir, privateDirs = [], entries, files, authorize, privileged }) {
-  const canonical = file => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+  const canonical = file => {
+    const suffix = [];
+    let current = path.resolve(file);
+    for (;;) {
+      try { return path.join(fs.realpathSync(current), ...suffix); }
+      catch (e) {
+        if (e.code !== 'ENOENT') throw e; // permission/IO/loop errors are not public paths
+        const parent = path.dirname(current);
+        if (parent === current) throw e;
+        suffix.unshift(path.basename(current)); current = parent;
+      }
+    }
+  };
   const parse = bytes => { try { return JSON.parse(bytes); } catch { throw Object.assign(new Error('Memory source claims invalid'), { status: 403 }); } };
   function admit(file, { requireSource = false } = {}) {
     const abs = canonical(file), all = entries();

@@ -53,12 +53,13 @@ const finished = (s, id) => until(async () => (await s.request('/api/jobs')).dat
 
 async function follow(t, s, token) {
   const abort = new AbortController(), events = []; let buffer = '';
-  const res = await fetch(s.base+'/api/events', { headers:{ Authorization:'Bearer '+token }, signal:abort.signal });
+  const res = await fetch(s.base+'/api/events', { headers:{ Authorization:'Bearer '+token }, signal:abort.signal })
+    .catch(e => { s.diagnose('event stream connect failed', e); throw e; });
   const reader = res.body.getReader(), decode = new TextDecoder();
   const pump = (async () => { try { for (;;) { const {done,value}=await reader.read(); if(done) break;
     buffer += decode.decode(value,{stream:true}); let n;
     while((n=buffer.indexOf('\n\n'))>=0) { const frame=buffer.slice(0,n); buffer=buffer.slice(n+2); const data=frame.split('\n').find(l=>l.startsWith('data: ')); if(data) events.push(JSON.parse(data.slice(6))); }
-  } } catch(e) { if(!abort.signal.aborted) throw e; } })();
+  } } catch(e) { if(!abort.signal.aborted) { s.diagnose('event stream read failed', e); throw e; } } })();
   const close=async()=>{abort.abort();await pump;}; t.after(close);
   const hello=await until(()=>events.find(e=>e.type==='hello'));
   assert.equal((await s.request('/api/programs/live',{conn:hello.conn},'POST',token)).status,200);
@@ -138,7 +139,8 @@ test('real opted backfill and document lanes use cold transport, canonical sourc
   assert.deepEqual(manifest.sourceKeys,[key]);
 });
 test('real held document lane refuses source eligibility narrowing even when actor retains act', {timeout:30000}, async t=>{
-  const s=await setup(t,'rollup'); assert.equal((await finished(s,await start(s))).status,'done');
+  const s=await setup(t,'rollup'), initialJob = await finished(s,await start(s));
+  assert.equal(initialJob.status,'done',JSON.stringify(initialJob)+s.log());
   const project=await publicSource(s), startDocs=await s.request('/api/project/memory/regenerate',{project});
   assert.equal(startDocs.status,202,JSON.stringify(startDocs)); await until(()=>s.requests.length===2);
   assert.equal((await s.request('/api/access',{id:key,mode:'listed',owners:['owner'],listed:{'user:actor':'act'}},'PUT')).status,200);

@@ -51,7 +51,13 @@ test('shipping search: cold note after restart and old/ambiguous derived markdow
   await until(()=>{try{return JSON.parse(fs.readFileSync(path.join(s.cache,'index.json'),'utf8'))[key]?.notePath===note;}catch{return false;}},'source note claim persisted before restart');
   await s.restart();
   const query='/api/search?q='+CANARY;
-  await until(async()=> (await s.request(query)).data.groups.some(g=>g.file===path.basename(note)),'real markdown indexing after restart');
+  // The lexical scanner indexes regular markdown, not symlinks; the alias is
+  // exercised below as a semantic hit against the same live source admission.
+  const indexedFiles = [path.basename(note), 'old-derived.md', 'projects/historical/overview.md'];
+  await until(async()=> {
+    const groups = (await s.request(query)).data.groups;
+    return indexedFiles.every(file => groups.some(g => g.file === file));
+  }, 'all fixture markdown indexed after restart');
   assert.equal((await s.request('/api/note?id='+encodeURIComponent(key),undefined,'GET','outsider-token')).status,403);
   const lexical=await s.request(query,undefined,'GET','outsider-token');assert.equal(lexical.status,200);
   assert.doesNotMatch(JSON.stringify(lexical.data.groups),new RegExp(CANARY));
@@ -81,7 +87,9 @@ test('shipping distill stream: read grant and credential revocation deny every l
   for(const withdrawal of ['grant','credential']) {
     const s=await serverFixture(t,true),id=await start(s);await until(()=>s.requests.length===1);
     const abort=new AbortController();const route='/api/distill-stream?id='+encodeURIComponent(key);
-    const reading=fetch(s.base+route,{headers:{Authorization:'Bearer reader-token'},signal:abort.signal}).then(async res=>{assert.equal(res.status,200);return res.text();});
+    const reading=fetch(s.base+route,{headers:{Authorization:'Bearer reader-token'},signal:abort.signal})
+      .then(async res=>{assert.equal(res.status,200);return res.text();})
+      .catch(e=>{if(!abort.signal.aborted)s.diagnose('distill stream connect/read failed',e);throw e;});
     reading.catch(()=>{});t.after(()=>abort.abort());
     await until(async()=>await s.probe({operation:'test-distill-listeners',key})===1,'real authorized subscriber installed');
     if(withdrawal==='grant') assert.equal((await s.request('/api/access',{id:key,mode:'listed',owners:['owner'],listed:{}},'PUT')).status,200);
@@ -104,7 +112,8 @@ test('shipping cleanup: captured detached provider descendants exit on completio
     const abort=new AbortController(),builder=createMultimodalMemory({programs:s.programs,settings:()=>s.settings,transport:s.transport,projectOf:()=> 'fixture',check(){}});
     const pending=builder.build(s.data(),s.file,{signal:abort.signal});pending.catch(()=>{});await s.waitForCapture();
     const capture=s.captures()[0],owned=processes.identity(capture.childPid);assert.ok(owned);
-    assert.equal(owned.pgrp,owned.pid,'provider descendant really leads a separate group');
+    // Windows has no POSIX PGID; its captured identity must still be cleaned.
+    if(process.platform !== 'win32') assert.equal(owned.pgrp,owned.pid,'provider descendant really leads a separate group');
     if(cancel){abort.abort();await assert.rejects(pending,e=>e.code==='ABORTED');}else await pending;
     findings.push({cancel,alive:processes.identity(owned.pid),tempExists:fs.existsSync(capture.cwd)});
     // Red teardown owns this exact fixture identity only; never kill a reused pid.
@@ -122,7 +131,9 @@ test('shipping cleanup: captured detached provider descendants exit on completio
   try {await assert.rejects(pending,e=>{retained=e.temporaryDirectory;return e.retainTemporaryState===true;});assert.equal(fs.existsSync(capture.cwd),true);}
   finally {
     processes.identity=original;const current=original(id.pid);if(current&&current.start===id.start&&current.boot===id.boot)process.kill(id.pid,'SIGKILL');
-    await until(()=>!processes.list().some(p=>processes.cwd(p.pid)===capture.cwd),'owned retained fixture processes exit');
+    await until(()=>{const current=original(id.pid);return !current||current.start!==id.start||current.boot!==id.boot;},'owned captured fixture identity exits');
+    // Windows has no cross-process cwd API; identity exit above remains required.
+    if(process.platform !== 'win32') await until(()=>!processes.list().some(p=>processes.cwd(p.pid)===capture.cwd),'owned retained fixture processes exit');
     if(retained)fs.rmSync(retained,{recursive:true,force:true});
   }
   assert.deepEqual(processes.identity(outside.pid),outsideId);

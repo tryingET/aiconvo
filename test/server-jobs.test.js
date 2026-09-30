@@ -9,7 +9,8 @@ const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
 
 test('allJobs retains live pipelines, recent restored runs, and model health without the retired batch map', () => {
   const start = source.indexOf('function allJobs() {');
-  const end = source.indexOf('\nfunction startDistillJob(', start);
+  // Extract allJobs only, not intervening top-level feature initialization.
+  const end = source.indexOf('\n}\n', start) + 2;
   assert.ok(start >= 0 && end > start);
   const now = Date.now();
   const names = ['distillJobs', 'evidenceJobs', 'epicJobs', 'memoryExtractJobs',
