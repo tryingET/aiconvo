@@ -17,7 +17,8 @@ async function until(fn, label = 'fixture condition') {
 }
 async function port() { const s = net.createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const p = s.address().port; await new Promise(r => s.close(r)); return p; }
 async function boot(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'local-integration-'));
+  // Expand Windows short temp names before the real server installs watchers.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'local-integration-')));
   const home = path.join(root, 'home'), tmp = path.join(root, 'tmp'), work = path.join(root, 'project');
   const config = path.join(root, 'config'), cache = path.join(root, 'cache'), data = path.join(root, 'data'), notes = path.join(root, 'notes');
   const agent = path.join(home, '.pi/agent');

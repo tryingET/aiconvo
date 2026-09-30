@@ -13,9 +13,15 @@ function macFixture() {
     [99, { ppid: 1, pgrp: 99, start: 'Wed Sep 30 20:00:03 2026' }],
   ]);
   let unreadable = null;
-  const apiProcess = { platform: 'darwin', env: {}, kill(pid) { if (!rows.has(pid)) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); } };
+  const apiProcess = { platform: 'darwin', env: { PATH: '/usr/bin:/bin' }, kill(pid) { if (!rows.has(pid)) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); } };
   const childProcess = { execFileSync(command, args) {
-    if (command === 'sysctl') return '{ sec = 123, usec = 0 }';
+    // The cold server's minimal PATH does not contain /usr/sbin. Reproduce
+    // that actual Mac fixture boundary instead of silently supplying a tool.
+    if (command === 'sysctl') throw Object.assign(new Error('sysctl absent from minimal PATH'), { code: 'ENOENT' });
+    if (command === '/usr/sbin/sysctl') {
+      assert.deepEqual(Array.from(args), ['-n', 'kern.boottime']);
+      return '{ sec = 123, usec = 0 }';
+    }
     assert.equal(command, 'ps');
     if (args.includes('-axww')) return [...rows].map(([pid, p]) => `${pid} ${p.ppid} ${p.pgrp} node synthetic`).join('\n');
     const pid = Number(args.at(-1));

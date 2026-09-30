@@ -96,17 +96,27 @@ function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onTh
       if (terminal) return;
       terminal = true; failure = error || null;
       if (!child?.pid) return;
-      deadline = Date.now() + 4000;
+      // Current Windows ownership requires bounded PowerShell/WMI queries;
+      // allow their serial cost rather than applying Linux's /proc budget.
+      const cleanupBudget = process.platform === 'win32' ? 30000 : process.platform === 'darwin' ? 8000 : 4000;
+      deadline = Date.now() + cleanupBudget;
       cleanupDeadline = setTimeout(() => {
         clearTimeout(timer); signal?.removeEventListener('abort', abort);
+        // This is the acquired IPC channel, not a guessed/reused PID. The
+        // supervisor stops its own unit on disconnect. Unknown descendants
+        // still make cleanup fail and keep temporary state; never claim exit.
+        if (child.connected) { try { child.disconnect(); } catch {} }
         reject(Object.assign(new Error('Memory tree cleanup not established; temporary state retained'), { retainTemporaryState: true }));
-      }, 4000);
+      }, cleanupBudget);
       try {
         owner.capture(anchor, deadline);
         killOK = true;
         signalOwned('SIGTERM');
         escalation = setTimeout(() => signalOwned('SIGKILL'), 150);
-      } catch { killOK = false; failure = new Error('Memory worker cleanup failed'); signalOwned('SIGKILL'); }
+      } catch {
+        killOK = false; failure = new Error('Memory worker cleanup failed'); signalOwned('SIGKILL');
+        if (child.connected) { try { child.disconnect(); } catch {} }
+      }
     };
     const abort = () => stop(stopped());
     const timer = setTimeout(() => stop(Object.assign(new Error('Memory model deadline exceeded; no replay'), { modelCallFailure: invoked })), timeoutMs);

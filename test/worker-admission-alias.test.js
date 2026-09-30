@@ -25,8 +25,8 @@ test('canonicalization errors other than ENOENT fail closed', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-parent-error-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const admission = createMemoryAdmission({ notesDir: root, cacheDir: root, entries: () => ({}), files: () => [], authorize() {}, privileged: () => false });
-  const original = fs.realpathSync;
-  fs.realpathSync = () => { throw Object.assign(new Error('synthetic denied ancestor'), { code: 'EACCES' }); };
+  const original = fs.realpathSync.native;
+  fs.realpathSync.native = () => { throw Object.assign(new Error('synthetic denied ancestor'), { code: 'EACCES' }); };
   try { assert.throws(() => admission.admit(path.join(root, 'orphan')), e => e.code === 'EACCES'); }
-  finally { fs.realpathSync = original; }
+  finally { fs.realpathSync.native = original; }
 });

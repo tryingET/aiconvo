@@ -11,7 +11,7 @@ function createMemoryAdmission({ notesDir, cacheDir, privateDirs = [], entries, 
     const suffix = [];
     let current = path.resolve(file);
     for (;;) {
-      try { return path.join(fs.realpathSync(current), ...suffix); }
+      try { return path.join(fs.realpathSync.native(current), ...suffix); }
       catch (e) {
         if (e.code !== 'ENOENT') throw e; // permission/IO/loop errors are not public paths
         const parent = path.dirname(current);

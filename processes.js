@@ -75,7 +75,7 @@ function darwinIdentity(pid) {
   const start = text.slice(0, 24).trim(), rest = text.slice(24).trim().split(/\s+/);
   if (/Z/.test(rest[1] || '')) return null;
   if (!darwinBoot) {
-    try { darwinBoot = (/sec = (\d+)/.exec(execFileSync('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 5000 })) || [])[1] || 'unknown'; }
+    try { darwinBoot = (/sec = (\d+)/.exec(execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 5000 })) || [])[1] || 'unknown'; }
     catch { darwinBoot = 'unknown'; }
   }
   return { pid, start, boot: darwinBoot, pgrp: Number(rest[0]) || null };
@@ -322,7 +322,7 @@ function ownership(pid) {
     if (!text) throw new Error('Current process identity unavailable');
     const rest = text.slice(24).trim().split(/\s+/);
     if (/Z/.test(rest[1] || '')) return null;
-    if (!darwinBoot) darwinBoot = (/sec = (\d+)/.exec(execFileSync('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 2000 })) || [])[1];
+    if (!darwinBoot) darwinBoot = (/sec = (\d+)/.exec(execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 2000 })) || [])[1];
     if (!darwinBoot || darwinBoot === 'unknown' || !/^\d+$/.test(rest[2] || '')) throw new Error('Current process ownership unavailable');
     return { pid, start: text.slice(0, 24).trim(), boot: darwinBoot, pgrp: Number(rest[0]), ppid: Number(rest[2]) };
   }
