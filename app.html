@@ -16224,6 +16224,8 @@ function paneModel() {
       <div class="set-help">${modelSupportsThinking(current.provider, current.model) ? 'How much the model reasons before it answers. Higher is slower and costs more.' : 'This model does not support thinking.'}</div>
     </div>
     ${backgroundAiSectionHtml()}
+    <label class="set-check"><input id="setMemoryImages" type="checkbox"${s.memoryImages ? ' checked' : ''}> inspect source images when making notes and memory</label>
+    <div class="set-help">Off by default. Requires a fixed model with image input. Uses a cold, model-only call, not a coding agent. Only verified inline PNG/JPEG source bytes are admitted; remote images are never fetched. Background memory still needs the consent above. Explicit provider extensions are trusted code, not a sandbox.</div>
     <h3>artifacts</h3>
     <label class="set-check"><input id="setArtifactLibraries" type="checkbox"${s.artifactNetwork === 'libraries' ? ' checked' : ''}> limit artifact pages to the public library sites</label>
     <div class="set-help">Pages, apps, slides and widgets that agents make run on a separate preview address, never on Chattering's own. By default they may load and call anything, like any website. Checked: their scripts, styles, fonts and network calls may only come from jsDelivr, unpkg, esm.sh, cdnjs and Google Fonts (what Claude and ChatGPT allow). Pictures may still come from anywhere.</div>
@@ -16361,6 +16363,7 @@ function bindPaneModel(root) {
     }, 'model: ' + modelLabelOf(m.provider, m.modelId));
   });
   $('setThinking').onchange = () => saveSettings({ thinking: $('setThinking').value }, 'thinking: ' + $('setThinking').value);
+  $('setMemoryImages').onchange = () => saveSettings({ memoryImages: $('setMemoryImages').checked }, 'source-image memory updated');
 }
 
 function muteRowHtml() {

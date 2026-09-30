@@ -52,6 +52,7 @@ function sizeOf(v) {
 function scopeOf(caller = {}) {
   const s = {};
   if (caller.conversation) s.key = String(caller.conversation);
+  if (Array.isArray(caller.conversations)) s.keys = caller.conversations.map(String);
   if (caller.project) s.project = String(caller.project);
   const p = caller.file || caller.repository;
   if (p) s.path = String(p);
