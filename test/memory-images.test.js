@@ -92,7 +92,19 @@ test('snapshots hash exact bytes, bound reads, and reject growth and same-size r
   const replacement = file + '.replacement'; fs.writeFileSync(replacement, 'new');
   try {
     fs.readSync = (...args) => { const n = read(...args); if (fs.existsSync(replacement)) fs.renameSync(replacement, file); return n; };
-    assert.throws(() => sourceSnapshot(file), /changed/);
+    assert.throws(() => sourceSnapshot(file), error => {
+      // Windows can refuse replacing a path while its descriptor is open.
+      // That fixture failure must propagate, not masquerade as a completed
+      // replacement or permit a returned snapshot. Keep the POSIX drift check.
+      if (process.platform === 'win32' && error.code === 'EPERM') {
+        assert.equal(fs.readFileSync(file, 'utf8'), 'old');
+        assert.equal(fs.readFileSync(replacement, 'utf8'), 'new');
+        return true;
+      }
+      assert.match(error.message, /changed/);
+      assert.equal(fs.readFileSync(file, 'utf8'), 'new');
+      return true;
+    });
   } finally { fs.readSync = read; }
 });
 test('opened FIFO/device and regular-to-FIFO replacement reject promptly and close descriptors',
