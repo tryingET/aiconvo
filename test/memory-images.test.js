@@ -5,6 +5,8 @@ const { LIMITS, decodeImage, sourceSnapshot, hydrate, packRows } = require('../m
 const { createHash } = require('node:crypto');
 const { spawnSync, execFileSync } = require('node:child_process');
 const { parseSnapshot } = require('../memory-source');
+const { revision } = require('../memory-identity');
+const captured = text => ({ text, revision: revision(text) });
 const fixture = require('./fixtures/image-fixture.cjs');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 function scratch(t) {
@@ -34,7 +36,7 @@ test('invalid base64, MIME ambiguity, remote sources and unsupported formats are
   assert.throws(() => decodeImage({ type: 'image', source: { type: 'base64', media_type: 'image/png', mediaType: 'image/jpeg', data: image.data } }));
 });
 test('direct/nested/image-only and branch attribution; byte identities do not depend on inspection', () => {
-  const text = fixture.jsonl(fixture.transcript()), snapshot = { text }, parsed = parseSnapshot('', text);
+  const text = fixture.jsonl(fixture.transcript()), snapshot = captured(text), parsed = parseSnapshot('', text);
   const on = hydrate(snapshot, parsed), off = hydrate(snapshot, parsed, LIMITS, { inspectImages: false });
   assert.equal(on.imageCount, 4);
   assert.equal(on.rows.find(r => r.eid === 'u1').assistantBefore.entry, 'a0');
@@ -52,14 +54,14 @@ test('direct/nested/image-only and branch attribution; byte identities do not de
 test('cycles, omitted attachments, references, budgets and malformed source fail closed', () => {
   const text = fixture.jsonl(fixture.transcript()), parsed = parseSnapshot('', text);
   const cyclic = structuredClone(parsed); cyclic.entryParents[0][1] = cyclic.entryParents[0][0];
-  assert.throws(() => hydrate({ text }, cyclic), /cyclic/);
+  assert.throws(() => hydrate(captured(text), cyclic), /cyclic/);
   const missing = structuredClone(parsed); missing.messages[0].images = [];
-  assert.throws(() => hydrate({ text }, missing), /no attributed/);
+  assert.throws(() => hydrate(captured(text), missing), /no attributed/);
   const changed = structuredClone(parsed); changed.messages[0].images[0].path = '999';
-  assert.throws(() => hydrate({ text }, changed), /image block missing/);
-  assert.throws(() => hydrate({ text }, parsed, { ...LIMITS, count: 1 }));
-  assert.throws(() => hydrate({ text }, parsed, { ...LIMITS, totalBytes: 1 }));
-  assert.throws(() => hydrate({ text: text + '{bad' }, parsed));
+  assert.throws(() => hydrate(captured(text), changed), /image block missing/);
+  assert.throws(() => hydrate(captured(text), parsed, { ...LIMITS, count: 1 }));
+  assert.throws(() => hydrate(captured(text), parsed, { ...LIMITS, totalBytes: 1 }));
+  assert.throws(() => hydrate(captured(text + '{bad'), parsed));
   assert.throws(() => parseSnapshot('', text + text.split('\n')[1]));
 });
 test('bounded snapshots reject source drift and invalid UTF-8', t => {
@@ -116,10 +118,10 @@ test('canonical padding, exact bytes, source form and aggregate image bounds', (
   assert.equal(decodeImage(image, { ...LIMITS, imageBytes: bytes.length }).data, image.data);
   assert.throws(() => decodeImage(image, { ...LIMITS, imageBytes: bytes.length - 1 }));
   const text = fixture.jsonl(fixture.transcript()), parsed = parseSnapshot('', text);
-  const admitted = hydrate({ text }, parsed), total = admitted.rows.flatMap(r => r.images).reduce((s, i) => s + i.bytes, 0);
-  assert.equal(hydrate({ text }, parsed, { ...LIMITS, count: 4, totalBytes: total }).imageCount, 4);
-  assert.throws(() => hydrate({ text }, parsed, { ...LIMITS, count: 3 }), /budget/);
-  assert.throws(() => hydrate({ text }, parsed, { ...LIMITS, totalBytes: total - 1 }), /budget/);
+  const admitted = hydrate(captured(text), parsed), total = admitted.rows.flatMap(r => r.images).reduce((s, i) => s + i.bytes, 0);
+  assert.equal(hydrate(captured(text), parsed, { ...LIMITS, count: 4, totalBytes: total }).imageCount, 4);
+  assert.throws(() => hydrate(captured(text), parsed, { ...LIMITS, count: 3 }), /budget/);
+  assert.throws(() => hydrate(captured(text), parsed, { ...LIMITS, totalBytes: total - 1 }), /budget/);
 });
 test('PNG framing, contiguous data, trailing compressed bytes and pixel bounds reject', () => {
   const zlib = require('node:zlib'), png = fixture.png(), header = png.subarray(8, 33), end = png.subarray(-12);
@@ -142,8 +144,8 @@ test('references reject duplicate, foreign-entry, ambiguous path and changed MIM
     p => p.messages[0].images[0].entry = 'u1',
     p => p.messages[0].images[0].path = '01',
     p => p.messages[0].images[0].mime = 'image/jpeg',
-  ]) { const p = structuredClone(parsed); mutate(p); assert.throws(() => hydrate({ text }, p)); }
-  const groups = packRows(hydrate({ text }, parsed).rows, 100000, { ...LIMITS, callImages: 1 });
+  ]) { const p = structuredClone(parsed); mutate(p); assert.throws(() => hydrate(captured(text), p)); }
+  const groups = packRows(hydrate(captured(text), parsed).rows, 100000, { ...LIMITS, callImages: 1 });
   assert.equal(groups.length, 4);
-  assert.deepEqual(groups.flatMap(g => g.images).map(i => i.data), hydrate({ text }, parsed).rows.flatMap(r => r.images).map(i => i.data));
+  assert.deepEqual(groups.flatMap(g => g.images).map(i => i.data), hydrate(captured(text), parsed).rows.flatMap(r => r.images).map(i => i.data));
 });

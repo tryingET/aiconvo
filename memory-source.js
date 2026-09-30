@@ -2,6 +2,20 @@
 // Pure snapshot projection for memory, not a replacement for server's UI parser.
 // Full source text is evidence; system/config entries are never user intent.
 const { createClaudeChain } = require('./claude-chain');
+// Validate transport aliases before any choice or projection. message.id is
+// a provider reply ID (shared across Claude tool lines), NOT an entry alias.
+function validateSourceEntry(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('Invalid source entry');
+  for (const [a, b] of [['id', 'uuid'], ['parentId', 'parentUuid']]) {
+    if (Object.hasOwn(d, a) && Object.hasOwn(d, b) && d[a] !== d[b]) throw new Error('Ambiguous source ' + a + '/' + b);
+    for (const key of [a, b]) if (Object.hasOwn(d, key) &&
+      !(key.startsWith('parent') && d[key] === null) && (typeof d[key] !== 'string' || !d[key])) throw new Error('Invalid source ' + key);
+  }
+  if (['user', 'assistant'].includes(d.type) && d.message && Object.hasOwn(d.message, 'role') && d.message.role !== d.type) {
+    throw new Error('Ambiguous source message role');
+  }
+  return d;
+}
 function parseSnapshot(_file, text) {
   const messages = [], parents = new Map(), chain = createClaudeChain();
   const meta = { firstTs: null, lastTs: null };
@@ -21,10 +35,9 @@ function parseSnapshot(_file, text) {
       ts: d.timestamp || null, origin: role === 'user' ? d.origin || d.message?.origin : undefined });
   };
   const ids = new Set();
-  for (const line of text.split('\n')) {
+  for (const line of text.replace(/^\uFEFF/, '').split('\n')) {
     if (!line.trim()) continue;
-    const d = JSON.parse(line);
-    if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('Invalid source entry');
+    const d = validateSourceEntry(JSON.parse(line));
     if (d.type === 'session') continue;
     const eid = d.id || d.uuid;
     if (eid != null) {
@@ -47,4 +60,4 @@ function parseSnapshot(_file, text) {
   for (const m of messages) if (!active.has(m.eid)) m.off = true;
   return { meta, messages, entryParents: [...parents] };
 }
-module.exports = { parseSnapshot };
+module.exports = { parseSnapshot, validateSourceEntry };

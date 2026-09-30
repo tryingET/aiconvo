@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const zlib = require('node:zlib');
 // Uncalled admission library: no settings, automation, workers or providers.
 const { revision } = require('./memory-identity');
+const { validateSourceEntry } = require('./memory-source');
 const LIMITS = Object.freeze({ sourceBytes: 128 * 1024 * 1024, imageBytes: 8 * 1024 * 1024,
   totalBytes: 32 * 1024 * 1024, count: 32, width: 2048, height: 2048, pixels: 4 * 1024 * 1024,
   callImages: 4, imageTokens: 16384 });
@@ -110,15 +111,34 @@ function sourceSnapshot(file, limits = LIMITS) {
     const bytes = buffer.subarray(0, length);
     let text;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { fail('source is not valid UTF-8'); }
-    return { text, revision: revision(bytes), stat: after };
+    // Keep the exact admitted bytes: UTF-8 decoding strips a leading BOM.
+    // A normalized-text digest cannot stand in for the original byte digest.
+    return { text, bytes, revision: revision(bytes), stat: after };
   } finally { fs.closeSync(fd); }
 }
 
+function checkedSnapshotText(snapshot, limits) {
+  if (!snapshot || typeof snapshot.text !== 'string') fail('snapshot text missing');
+  if (typeof snapshot.revision !== 'string' || !/^[a-f0-9]{64}$/.test(snapshot.revision)) fail('snapshot revision must be SHA-256');
+  if (Buffer.byteLength(snapshot.text) > limits.sourceBytes) fail('snapshot exceeds source budget');
+  const raw = snapshot.bytes !== undefined;
+  if (raw && !(snapshot.bytes instanceof Uint8Array)) fail('snapshot bytes must be a byte array');
+  const bytes = raw ? snapshot.bytes : Buffer.from(snapshot.text, 'utf8');
+  if (bytes.byteLength > limits.sourceBytes) fail('snapshot exceeds source budget');
+  if (revision(bytes) !== snapshot.revision) fail('snapshot revision does not match source bytes');
+  let text;
+  try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: !raw }).decode(bytes); }
+  catch { fail('snapshot bytes are not valid UTF-8'); }
+  if (text !== snapshot.text) fail('snapshot text does not match its byte binding');
+  return text.replace(/^\uFEFF/, '');
+}
+
 function hydrate(snapshot, data, limits = LIMITS, { inspectImages = true } = {}) {
-  const entries = new Map();
-  for (const line of snapshot.text.split('\n')) {
+  const text = checkedSnapshotText(snapshot, limits), entries = new Map();
+  for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let d; try { d = JSON.parse(line); } catch { fail('malformed source JSONL'); }
+    validateSourceEntry(d);
     if (d.type === 'session') continue;
     const id = d.id || d.uuid;
     if (id) {
@@ -195,26 +215,44 @@ function hydrate(snapshot, data, limits = LIMITS, { inspectImages = true } = {})
 }
 
 function packRows(rows, tokenBudget, limits = LIMITS) {
-  const groups = []; let group = [], cost = 0, count = 0;
+  // A declared heuristic only: ceil(UTF-8 body bytes / 2) + supplied image
+  // estimates. Includes the whole returned envelope, not provider tokenization.
+  if (!Number.isFinite(tokenBudget) || tokenBudget < 0 || !Number.isFinite(limits.imageTokens) || limits.imageTokens < 0 ||
+      !Number.isInteger(limits.callImages) || limits.callImages < 0) fail('invalid per-call budget');
+  const estimate = (bytes, images) => Math.ceil(bytes / 2) + images * limits.imageTokens;
+  const manifestItem = (image, n) => ({ attachment: n + 1, messageIndex: image.messageIndex, reference: image.reference, identity: image.identity });
+  // At most one section per row; reserve the widest possible section numbers
+  // before the final section count is known. Incremental bytes avoid quadratic
+  // serialization for long text-only inputs.
+  const headerBytes = Buffer.byteLength(`SECTION ${rows.length}/${rows.length}\nAttachment order: `);
+  const manifestAddition = (images, start) => images.reduce((sum, image, n) =>
+    sum + Buffer.byteLength(JSON.stringify(manifestItem(image, start + n))) + (start + n ? 1 : 0), 0);
+  const groups = []; let group = [], bodyBytes = 0, manifestBytes = 2, count = 0;
   for (const row of rows) {
     const text = JSON.stringify({ id: row.id, entry: row.eid, parent: row.parent, offBranch: !!row.off,
       role: row.role, origin: row.origin, name: row.name, text: row.text || '', assistantBefore: row.assistantBefore,
       attachments: row.images.map(i => ({ reference: i.reference, identity: i.identity, width: i.width, height: i.height,
         inspection: i.inspected === false ? 'intentionally not inspected' : 'supplied' })) });
-    const supplied = row.images.filter(i => i.inspected !== false).length;
-    const tokens = Math.ceil(Buffer.byteLength(text) / 2) + supplied * limits.imageTokens;
-    if (tokens > tokenBudget || supplied > limits.callImages) fail('one attributed message exceeds the per-call budget');
-    if (group.length && (cost + tokens > tokenBudget || count + supplied > limits.callImages)) {
-      groups.push(group); group = []; cost = 0; count = 0;
+    const images = row.images.filter(i => i.inspected !== false), textBytes = Buffer.byteLength(text);
+    let addedManifest = manifestAddition(images, count);
+    if (group.length && (estimate(headerBytes + manifestBytes + addedManifest + 1 + bodyBytes + 1 + textBytes, count + images.length) > tokenBudget ||
+        count + images.length > limits.callImages)) {
+      groups.push(group); group = []; bodyBytes = 0; manifestBytes = 2; count = 0;
+      addedManifest = manifestAddition(images, 0);
     }
-    group.push({ ...row, packedText: text }); cost += tokens; count += supplied;
+    const nextBody = bodyBytes + (group.length ? 1 : 0) + textBytes;
+    if (estimate(headerBytes + manifestBytes + addedManifest + 1 + nextBody, count + images.length) > tokenBudget ||
+        count + images.length > limits.callImages) fail('one attributed message exceeds the per-call budget');
+    group.push({ ...row, packedText: text }); bodyBytes = nextBody; manifestBytes += addedManifest; count += images.length;
   }
   if (group.length) groups.push(group);
   return groups.map((group, i) => {
     const images = group.flatMap(row => row.images).filter(i => i.inspected !== false);
-    const manifest = images.map((image, n) => ({ attachment: n + 1, messageIndex: image.messageIndex, reference: image.reference, identity: image.identity }));
-    return { text: `SECTION ${i + 1}/${groups.length}\nAttachment order: ${JSON.stringify(manifest)}\n` + group.map(r => r.packedText).join('\n'),
-      images: images.map(({ type, data, mimeType }) => ({ type, data, mimeType })), ids: group.map(r => r.id) };
+    const manifest = images.map(manifestItem);
+    const text = `SECTION ${i + 1}/${groups.length}\nAttachment order: ${JSON.stringify(manifest)}\n` + group.map(r => r.packedText).join('\n');
+    // Check the actual returned body as well, using exactly the same estimator.
+    if (estimate(Buffer.byteLength(text), images.length) > tokenBudget || images.length > limits.callImages) fail('packed section exceeds the per-call budget');
+    return { text, images: images.map(({ type, data, mimeType }) => ({ type, data, mimeType })), ids: group.map(r => r.id) };
   });
 }
 module.exports = { LIMITS, crc32, validatePng, decodeImage, sourceSnapshot, hydrate, packRows };

@@ -42,7 +42,7 @@ test('Claude parallel tools retain native chain linearization and attachment anc
   ];
   const text = jsonl(entries), parsed = parseSnapshot('', text), parents = new Map(parsed.entryParents);
   assert.equal(parents.get('r1'), 'a2'); assert.equal(parents.get('r2'), 'r1');
-  const result = hydrate({ text }, parsed);
+  const result = hydrate({ text, revision: revision(text) }, parsed);
   assert.equal(result.imageCount, 3);
   assert.ok(result.rows.every(r => !r.off));
   for (const row of result.rows.filter(r => r.role === 'toolresult')) {
@@ -69,10 +69,10 @@ for (const entry of [null, [], 1, { type: 'message', message: { role: 'user', co
 test('unsupported descriptors are preserved without inspection and never fetched; inspection rejects', () => {
   const remote = { type: 'image', source: { type: 'url', url: 'https://invalid.example/image' } };
   const text = jsonl([{ type: 'user', uuid: 'u', message: { content: [remote] } }]), parsed = parseSnapshot('', text);
-  const off = hydrate({ text }, parsed, LIMITS, { inspectImages: false });
+  const off = hydrate({ text, revision: revision(text) }, parsed, LIMITS, { inspectImages: false });
   assert.equal(off.imageCount, 1); assert.equal(off.rows[0].images[0].inspected, false);
   assert.equal(off.rows[0].images[0].identity, revision(JSON.stringify(remote)));
-  assert.throws(() => hydrate({ text }, parsed), /unsupported image source/);
+  assert.throws(() => hydrate({ text, revision: revision(text) }, parsed), /unsupported image source/);
 });
 
 test('neutral SHA-256 identity and library dependency closure exclude workers, settings and titles', () => {
