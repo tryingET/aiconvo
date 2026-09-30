@@ -16,7 +16,8 @@ async function until(fn, message, timeout = 15000) {
   throw new Error('Timed out: ' + message);
 }
 async function fixture(t) {
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'memory-auto-server-')));
+  // Native realpath expands Windows 8.3 names before recursive fs.watch.
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'memory-auto-server-')));
   const agent = path.join(home, '.pi', 'agent'), sessions = path.join(agent, 'sessions', 'fixture');
   const work = path.join(home, 'work'); fs.mkdirSync(work); fs.mkdirSync(sessions, { recursive: true });
   const session = (id, origin = '2020-01-01T00:00:00Z') => path.join(sessions, id + '.jsonl');
