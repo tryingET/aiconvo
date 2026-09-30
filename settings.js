@@ -70,6 +70,8 @@ const DEFAULT_SETTINGS = {
   voiceModelUrl: '',
   voiceModel: '',
   backgroundAi: { ...BACKGROUND_AI_UNDECIDED },
+  // Independent scope policy; legacy preserves the existing consent switch.
+  automaticMemory: 'legacy',
   welcome: { ...WELCOME_UNDONE },
   // Engine for web sends: 'sdk' embeds pi in-process (fast forks, full
   // extension UI); 'rpc' spawns pi child processes (isolation fallback).
@@ -459,6 +461,8 @@ function normalizeSettings(input) {
     voiceModelUrl,
     voiceModel,
     backgroundAi,
+    automaticMemory: src.automaticMemory === undefined ? 'legacy' :
+      ['legacy', 'off', 'changes-after-enable'].includes(src.automaticMemory) ? src.automaticMemory : 'off',
     welcome,
     piEngine,
     artifactNetwork,
