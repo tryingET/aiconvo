@@ -108,9 +108,11 @@ test('a stale/double finish cannot release another running ticket', t => {
   policy.finish(fresh); assert.deepEqual(policy.ready(), ['second']);
 });
 
-test('state is owner-readable, durable, and outside disposable cache roots', t => {
+test('state is durable and outside disposable cache roots; owner-only mode on POSIX', t => {
   const { policy, file, load } = setup(t); policy.activate(mode, { session: a }); policy.observe('session', b);
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  // Node's Windows mode bits are not a Windows ACL/privacy check. Durability
+  // and fail-closed behavior remain checked on every platform.
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   assert.deepEqual(load().ready(), ['session']);
   assert.deepEqual(fs.readdirSync(path.dirname(file)), ['memory-automation.json']);
 });

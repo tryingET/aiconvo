@@ -23,13 +23,15 @@ test('saved history hides the request, links both answers, and counts successful
     { type: 'custom', id: 'failed', parentId: 's', customType: CUSTOM_TYPE, data: { state: 'failed', response: { ...response('Incomplete'), stopReason: 'length' } } },
   ].map(JSON.stringify).join('\n'));
   const source = fs.readFileSync(require.resolve('../server'), 'utf8');
-  const start = source.indexOf('async function parseFile(absPath) {'), end = source.indexOf('\nasync function transcriptImage(', start);
+  const start = source.indexOf('async function parseFile('), end = source.indexOf('\nasync function transcriptImage(', start);
   assert.ok(start >= 0 && end > start);
-  const context = { fs, readline, settingsLib: require('../settings'), conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
+  const context = { fs, readline, require: specifier => { assert.equal(specifier, 'node:stream'); return require(specifier); }, settingsLib: require('../settings'), conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
     textOf: content => typeof content === 'string' ? content : (content || []).filter(b => b.type === 'text').map(b => b.text).join('\n'),
     toolEventsOf: () => [], directImagesOf: () => [], pathCandidates: () => [], isNoise: () => false };
   vm.createContext(context); vm.runInContext(source.slice(start, end), context);
-  const parsed = await context.parseFile(file);
+  const parsed = await context.parseFile(file); // Keep the ordinary one-argument disk parser exercised.
+  const captured = await context.parseFile(file + '.not-on-disk', fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(JSON.parse(JSON.stringify(captured)), JSON.parse(JSON.stringify(parsed)), 'captured text preserves rewrite/history metadata without reopening the filename');
   assert.deepEqual(Array.from(parsed.messages, m => m.text), ['Explain it.', 'Technical original.', 'Everyday explanation.']);
   assert.equal(parsed.messages[2].rewriteOf, 'a');
   assert.ok(parsed.entryParents.some(([id]) => id === 'request'), 'hidden request stays in the ancestry');
