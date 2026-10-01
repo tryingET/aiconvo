@@ -19,6 +19,7 @@
    its public key, its person, its credential. Pairing codes live in memory
    only; a restart ends any that were showing. */
 const fs = require('fs');
+const { ensurePrivateFileSync, writePrivateFileSync } = require('./private-file');
 const path = require('path');
 const http = require('http');
 const zlib = require('zlib');
@@ -96,16 +97,15 @@ function createAnywhereHome(opts) {
   let ws = null, relayState = 'off', relayError = '', retry = 0, retryTimer = null, stopped = false, iceServers = [];
 
   function load() {
+    // Do not hide an OS security failure as an empty credential store.
+    try { ensurePrivateFileSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     try {
       const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
       return { key: raw.key || null, devices: Array.isArray(raw.devices) ? raw.devices : [] };
     } catch { return { key: null, devices: [] }; }
   }
   function save() {
-    fs.mkdirSync(dataDir, { recursive: true });
-    const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 1) + '\n', { mode: 0o600 });
-    fs.renameSync(tmp, file);
+    writePrivateFileSync(file, JSON.stringify(state, null, 1) + '\n');
   }
   async function ensureKey() {
     if (key) return key;
