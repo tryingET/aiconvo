@@ -114,7 +114,39 @@ async function* streamEvents(lib, request, run) {
  * `onDelta` and `onThinking` receive the reply's text and thinking as Pi
  * writes them (a streamed call only).
  */
-function createPiRouter({ lib, exec }) {
+function modelMessage(request) {
+  const { decodeImage, LIMITS } = require('./memory-images');
+  let count = 0;
+  const parts = (value, role) => {
+    if (typeof value === 'string') return value;
+    return (value || []).map(p => {
+      if (p.type === 'text') return { type: 'text', text: p.text || '' };
+      if (p.type === 'thinking' && role === 'assistant') return { type: 'thinking', thinking: p.text || '' };
+      if (p.type === 'image' && role === 'user' && !p.url && !p.fileId) {
+        if (++count > LIMITS.callImages) throw new Error('Memory image count exceeds budget');
+        const image = decodeImage({ type: 'image', data: p.data, mimeType: p.mediaType });
+        return { type: 'image', data: image.data, mimeType: image.mimeType };
+      }
+      throw Object.assign(new Error('Unsupported memory model part'), { code: 'UNSUPPORTED_PART' });
+    });
+  };
+  const messages = (request.messages || []).map(m => {
+    if (!['user', 'assistant'].includes(m.role)) throw new Error('Unsupported memory role');
+    return { role: m.role, content: parts(m.parts, m.role), timestamp: Date.now() };
+  });
+  if (!messages.length || messages.at(-1).role !== 'user') throw new Error('Memory request must end with user input');
+  return { messages: [{ role: 'system', content: partsText(request.system || ''), toolsAdded: [], timestamp: Date.now() }, ...messages] };
+}
+
+function createPiRouter({ lib, exec, modelExec = null, memoryOptions = () => null }) {
+  const route = (request, opts, onDelta, onThinking) => {
+    const memory = memoryOptions();
+    if (!memory) return exec({ ...piMessage(request), signal: opts.signal, ...(onDelta ? { onDelta, onThinking } : {}) });
+    memory.check();
+    if (!modelExec) throw new Error('No cold memory transport; user-agent fallback forbidden');
+    return Promise.resolve(modelExec({ ...modelMessage(request), onDelta, onThinking }, { ...memory, signal: opts.signal }))
+      .then(message => { memory.check(); return message; });
+  };
   return {
     resolve(model) {
       const s = String(model || '');
@@ -122,11 +154,10 @@ function createPiRouter({ lib, exec }) {
       return i > 0 ? { provider: s.slice(0, i), model: s.slice(i + 1) } : { provider: 'pi', model: s || 'default' };
     },
     async complete(request, opts = {}) {
-      return toResponse(lib, request, await exec({ ...piMessage(request), signal: opts.signal }));
+      return toResponse(lib, request, await route(request, opts));
     },
     stream(request, opts = {}) {
-      const m = piMessage(request);
-      return streamEvents(lib, request, (onDelta, onThinking) => exec({ ...m, signal: opts.signal, onDelta, onThinking }));
+      return streamEvents(lib, request, (onDelta, onThinking) => route(request, opts, onDelta, onThinking));
     },
   };
 }
@@ -158,4 +189,4 @@ function createChatRouter({ lib, post, endpoint, extra = {} }) {
   };
 }
 
-module.exports = { createPiRouter, createChatRouter, piMessage, toResponse, streamEvents, usageOf };
+module.exports = { createPiRouter, createChatRouter, piMessage, modelMessage, toResponse, streamEvents, usageOf };

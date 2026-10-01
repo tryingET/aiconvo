@@ -75,7 +75,7 @@ function darwinIdentity(pid) {
   const start = text.slice(0, 24).trim(), rest = text.slice(24).trim().split(/\s+/);
   if (/Z/.test(rest[1] || '')) return null;
   if (!darwinBoot) {
-    try { darwinBoot = (/sec = (\d+)/.exec(execFileSync('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 5000 })) || [])[1] || 'unknown'; }
+    try { darwinBoot = (/sec = (\d+)/.exec(execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 5000 })) || [])[1] || 'unknown'; }
     catch { darwinBoot = 'unknown'; }
   }
   return { pid, start, boot: darwinBoot, pgrp: Number(rest[0]) || null };
@@ -288,5 +288,68 @@ function usage(pid) {
   return null;
 }
 
+// Memory cleanup needs fresh, fail-closed ownership records, not Windows'
+// background discovery snapshot or a null that might mean a failed ps query.
+function ownershipList() {
+  if (PLATFORM === 'linux') return linuxList().flatMap(p => {
+    const record = ownership(p.pid); return record ? [{ ...record, argv: p.argv }] : [];
+  });
+  if (PLATFORM === 'darwin') {
+    const text = execFileSync('ps', ['-axww', '-o', 'pid=,ppid=,pgid=,command='], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000 });
+    return text.split('\n').flatMap(line => {
+      const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), pgrp: Number(m[3]), argv: m[4].split(' ') }] : [];
+    });
+  }
+  if (PLATFORM === 'win32') return parseWinList(execFileSync(POWERSHELL, psArgs(WIN_LIST_SCRIPT),
+    { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }));
+  throw new Error('Current process ownership unavailable');
+}
+function ownership(pid) {
+  if (PLATFORM === 'linux') {
+    let fields;
+    try { const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); fields = stat.slice(stat.lastIndexOf(')') + 2).split(' '); }
+    catch (e) { if (['ENOENT', 'ESRCH'].includes(e.code)) return null; throw e; }
+    if (fields[0] === 'Z' || fields[0] === 'X') return null;
+    linuxBoot ||= fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return { pid, start: fields[19], boot: linuxBoot, pgrp: Number(fields[2]), ppid: Number(fields[1]) };
+  }
+  if (PLATFORM === 'darwin') {
+    let text;
+    try { text = execFileSync('ps', ['-o', 'lstart=,pgid=,stat=,ppid=', '-p', String(pid)],
+      { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
+    catch (e) { try { process.kill(pid, 0); } catch (gone) { if (gone.code === 'ESRCH') return null; } throw e; }
+    if (!text) throw new Error('Current process identity unavailable');
+    const rest = text.slice(24).trim().split(/\s+/);
+    if (/Z/.test(rest[1] || '')) return null;
+    if (!darwinBoot) darwinBoot = (/sec = (\d+)/.exec(execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 2000 })) || [])[1];
+    if (!darwinBoot || darwinBoot === 'unknown' || !/^\d+$/.test(rest[2] || '')) throw new Error('Current process ownership unavailable');
+    return { pid, start: text.slice(0, 24).trim(), boot: darwinBoot, pgrp: Number(rest[0]), ppid: Number(rest[2]) };
+  }
+  if (PLATFORM === 'win32') {
+    if (!winAlive(pid)) return null;
+    // Query current birth + parent together, checking birth again after WMI.
+    // Populate discovery's cache only from this fresh record, never the reverse.
+    const birth = `[System.Diagnostics.Process]::GetProcessById(${Number(pid)}).StartTime.ToUniversalTime().ToString('o')`;
+    const script = LOAD_WMI + `$before = ${birth}; $parent = $null; foreach ($p in [System.Management.ManagementObjectSearcher]::new('SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = ${Number(pid)}').Get()) { $parent = $p['ParentProcessId']; break }; $after = ${birth}; if ($before -ne $after -or $null -eq $parent) { throw 'Process ownership changed' }; '{0}\t{1}' -f $before, $parent; ` +
+      (!winBoot || winBoot === 'unknown' ? WIN_BOOT_SCRIPT : '');
+    let lines;
+    try {
+      lines = execFileSync(POWERSHELL, psArgs(script), { encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
+    } catch (error) {
+      // A process can exit during the query. Only a fresh kernel ESRCH proves
+      // absence; live, reused, denied or otherwise uncertain PIDs still fail.
+      try { process.kill(pid, 0); }
+      catch (gone) { if (gone.code === 'ESRCH') return null; }
+      throw error;
+    }
+    const [start, parent] = lines[0].split('\t');
+    if (!winBoot || winBoot === 'unknown') winBoot = lines[1];
+    if (!start || !winBoot || winBoot === 'unknown' || !/^\d+$/.test(parent || '')) throw new Error('Current process ownership unavailable');
+    winStarts.set(pid, { start, checkedAt: Date.now() });
+    return { pid, start, boot: winBoot, pgrp: pid, ppid: Number(parent) };
+  }
+  throw new Error('Current process ownership unavailable');
+}
 function identityProblem() { return lastIdentityProblem; }
-module.exports = { reliable, list, warm, identity, identityProblem, cwd, stopTree, descendantsOf, usage, psDurationMs, splitWindowsCommandLine, parseWinList };
+module.exports = { reliable, list, warm, identity, identityProblem, ownership, ownershipList, cwd, stopTree, descendantsOf, usage, psDurationMs, splitWindowsCommandLine, parseWinList };

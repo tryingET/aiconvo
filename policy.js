@@ -425,6 +425,7 @@ const EVENTS = {
   'doc-commit-titled': ev => can => !ev.root || can.path(ev.root),
   job: ev => can => {
     const j = ev.job || {};
+    if (j.memoryScope && (!Array.isArray(j.sessionIds) || !j.sessionIds.length || !j.sessionIds.every(key => can.key(key)))) return false;
     if (j.key) return can.key(j.key);
     if (j.project) return can.project(j.project);
     return can.member; // machine-wide work (memory batches, model health)
@@ -468,7 +469,7 @@ const EVENTS = {
   // conversation, project, and file or repository.
   'program-live': ev => can => {
     if (!can.member) return null;
-    const sees = s => !s || ((!s.key || can.key(s.key)) && (!s.project || can.project(s.project)) && (!s.path || can.path(s.path)));
+    const sees = s => !s || ((!s.key || can.key(s.key)) && (!s.keys || s.keys.every(key => can.key(key))) && (!s.project || can.project(s.project)) && (!s.path || can.path(s.path)));
     const ops = [];
     for (const op of ev.ops || []) {
       if (op.op === 'snapshot') ops.push({ ...op, calls: (op.calls || []).filter(c => sees(c.scope)) });

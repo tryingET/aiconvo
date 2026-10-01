@@ -53,6 +53,9 @@ const DEFAULT_SETTINGS = {
   model: '',
   thinking: 'off',
   contextTokens: DEFAULT_CONTEXT_TOKENS,
+  // Explicit image-memory opt-in. Background consent remains backgroundAi.memory.
+  memoryImages: false,
+  providerExtensions: {},
   // Optional GPU-server late-interaction search stage (off by default).
   semanticSearch: false,
   semanticUrl: '',
@@ -223,6 +226,9 @@ const MODEL_NAME = /^[\w./:@-]{1,200}$/;
 // types by hand are checked; everything else is normalized as before.
 function settingsInputError(src) {
   if (!src || typeof src !== 'object') return 'settings must be an object';
+  if (src.memoryImages !== undefined && typeof src.memoryImages !== 'boolean') return 'memoryImages must be a boolean';
+  if (src.providerExtensions !== undefined && (!src.providerExtensions || typeof src.providerExtensions !== 'object' || Array.isArray(src.providerExtensions) ||
+      Object.values(src.providerExtensions).some(paths => !Array.isArray(paths) || paths.some(p => typeof p !== 'string' || !require('path').isAbsolute(p))))) return 'providerExtensions must name explicit absolute entrypoints';
   const urls = { semanticUrl: 'the search server', speechUrl: 'the speech-to-text server', ttsUrl: 'the read-aloud server', voiceModelUrl: 'the spoken-digest model endpoint' };
   for (const [k, what] of Object.entries(urls)) {
     const v = String(src[k] || '').trim();
@@ -450,6 +456,8 @@ function normalizeSettings(input) {
     model: piDefault ? '' : model,
     thinking,
     contextTokens,
+    memoryImages: src.memoryImages === true,
+    providerExtensions: src.providerExtensions && typeof src.providerExtensions === 'object' && !Array.isArray(src.providerExtensions) ? structuredClone(src.providerExtensions) : {},
     semanticSearch,
     semanticUrl,
     semanticNs,

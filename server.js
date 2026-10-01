@@ -713,16 +713,17 @@ try { index = JSON.parse(fs.readFileSync(INDEX_FILE, 'utf8')); } catch { index =
 // loss right after the call cannot leave an empty file under the final name.
 // Caches skip the fsync (they are rebuilt from the transcripts anyway).
 let atomicWriteSeq = 0;
-async function writeFileAtomic(p, data, { sync = false } = {}) {
+async function writeFileAtomic(p, data, { sync = false, guard = coldMemoryContext.getStore()?.guard } = {}) {
   const tmp = p + '.tmp-' + process.pid + '-' + (++atomicWriteSeq) + '-' + Math.random().toString(36).slice(2, 8);
   try {
     if (sync) {
-      const fh = await fsp.open(tmp, 'w');
+      const fh = await fsp.open(tmp, 'w', guard ? 0o600 : undefined);
       try { await fh.writeFile(data); await fh.sync(); } finally { await fh.close(); }
     } else {
-      await fsp.writeFile(tmp, data);
+      await fsp.writeFile(tmp, data, guard ? { mode: 0o600 } : undefined);
     }
-    await platform.renameRetry(tmp, p);
+    if (guard) { guard(); fs.renameSync(tmp, p); }
+    else await platform.renameRetry(tmp, p);
   } catch (e) {
     await fsp.unlink(tmp).catch(() => {});
     throw e;
@@ -760,6 +761,7 @@ async function persistModelHealth(state) {
   }
 }
 const modelCallContext = new AsyncLocalStorage();
+const coldMemoryContext = new AsyncLocalStorage();
 const memoryModelHealth = createModelHealth({
   initialState: savedModelHealth,
   onChange: state => {
@@ -1187,12 +1189,17 @@ async function transcriptImage(key, entry, blockPath) {
 // only what the person behind it may see (policy.eventView): an event about
 // a hidden conversation, project or file never leaves the server for them.
 const policy = require('./policy.js');
-const sseByConn = new Map(); // conn id → { res, identity, conn, receiver }
+const sseByConn = new Map(); // conn id → bound sign-in proof, rechecked for every push
+function eventMemoryIdentity(client) {
+  const identity = client.proof ? wallsFor(LAN_TOKEN ? usersLib.identify({ roster, installToken: LAN_TOKEN, ...client.proof }) : ownerIdentity()) : liveMemoryIdentity(client.identity);
+  if (!identity) { client.res.end(); return null; }
+  return identity;
+}
 function broadcast(ev) {
   const line = 'data: ' + JSON.stringify(ev) + '\n\n';
   for (const client of sseByConn.values()) {
     let view;
-    try { view = policy.eventView(ev, client.receiver || (client.receiver = receiverFor(client.identity))); }
+    try { view = policy.eventView(ev, receiverFor(eventMemoryIdentity(client))); }
     catch (e) { console.error('[events] ' + (ev && ev.type) + ': ' + e.message); view = null; }
     if (!view) continue;
     try { client.res.write(view === ev ? line : 'data: ' + JSON.stringify(view) + '\n\n'); } catch {}
@@ -1202,13 +1209,14 @@ function broadcast(ev) {
 // rules can change while a stream is open, so nothing here is cached
 // beyond the identity itself.
 function receiverFor(identity) {
+  identity = liveMemoryIdentity(identity);
   const all = policy.isOwnerTier(identity);
   const member = all || (!!identity && !!identity.user && !usersLib.isWalled(identity.user));
   return {
     all, member,
     // A key not indexed yet (a run's first moments): the household sees it,
     // a guest waits until it is known to be theirs.
-    key: k => all || (!!k && index[k] ? keyVisible(identity, k) : member),
+    key: k => !!identity && (all || (!!k && index[k] ? keyVisible(identity, k) : false)),
     project: name => all || projectVisible(identity, name || null),
     path: abs => {
       if (all) return true;
@@ -1614,7 +1622,11 @@ async function indexFile(source, relPath, stat) {
     const firstUser = titleSourceMessage(messages);
     const fullTitle = delegated ? delegated.title : firstUser ? firstUser.text.slice(0, 200).replace(/\s+/g, ' ').trim() : '(no user message)';
     const titleHash = crypto.createHash('sha256').update('v2\x00' + fullTitle).digest('hex').slice(0, 16);
-    const memoryHash = memoryFingerprint.fingerprint(messages);
+    let memoryHash = memoryFingerprint.fingerprint(messages);
+    if (appSettings.memoryImages) {
+      try { memoryHash = memoryFeature.fingerprint(require('./memory-images').sourceSnapshot(absPath).revision); }
+      catch { memoryHash = null; }
+    }
     const savedTimelineTitle = timelineTitles[key];
     // A manual (or user-requested AI) title override wins over anything re-derived here.
     const manualTitle = savedTimelineTitle && savedTimelineTitle.manual ? savedTimelineTitle : null;
@@ -2106,6 +2118,21 @@ function scheduleSemanticSync(delay = 5000) {
   semTimer = setTimeout(syncSemantic, delay);
 }
 setInterval(() => scheduleSemanticSync(1000), 5 * 60 * 1000);
+
+// Search markdown has no conversation key. Never treat that absence as public:
+// bind every derived hit to current source claims, including old notes/aliases.
+function searchGroupVisible(identity, group) {
+  if (group.key && (!index[group.key] || !keyVisible(identity, group.key))) return false;
+  if (!group.file) return !!group.key;
+  if (typeof group.file !== 'string') return false;
+  const file = path.resolve(NOTES_DIR, group.file);
+  if (!platform.isInside(file, NOTES_DIR)) return false;
+  try {
+    memoryAdmissionFor(identity).admit(file, { requireSource: true })();
+    assertPathAccess(identity, file, 'see');
+    return true;
+  } catch { return false; }
+}
 
 // Reshape GPU hits into the grouped format the client renders.
 function semanticGroups(hits) {
@@ -5554,7 +5581,15 @@ function targetOf(key) {
   const e = key && index[key];
   return { key: key || null, project: e ? projectNameOf(e.cwd, key) : null, creator: e && e.createdBy ? usersLib.resolveId(roster, e.createdBy) : null };
 }
-function canDo(identity, right, target) { return accessLib.can(accessRules, identity, right, target); }
+function liveMemoryIdentity(identity) {
+  const req = requestContext.getStore()?.req;
+  if (req && identity?.user?.id === currentIdentity()?.user?.id) return identifyRequest(req);
+  if (!identity?.user) return null;
+  const user = usersLib.findUser(roster, identity.user.id);
+  if (!user || user.disabled) return null;
+  return wallsFor({ ...identity, user, tier: identity.tier === 'console' && user.role === 'owner' ? 'console' : user.role });
+}
+function canDo(identity, right, target) { return accessLib.can(accessRules, liveMemoryIdentity(identity), right, target); }
 function assertCan(identity, right, target, what = 'this') {
   if (!canDo(identity, right, target)) {
     const err = new Error(right === 'own' ? 'Only the owner of ' + what + ' can change how it is shared.' : right === 'act' ? 'You can read ' + what + ' but not act on it here.' : 'This is not shared with you.');
@@ -5571,7 +5606,7 @@ function assertCan(identity, right, target, what = 'this') {
     throw err;
   }
 }
-const visibleKeysFor = identity => accessLib.visibleTo(accessRules, identity);
+const visibleKeysFor = identity => accessLib.visibleTo(accessRules, liveMemoryIdentity(identity));
 function keyVisible(identity, key) { return visibleKeysFor(identity)(targetOf(key)); }
 function projectCreatorOf(name) {
   const rec = name && typeof createdRecordFor === 'function' ? createdRecordFor(name) : null;
@@ -5758,6 +5793,8 @@ function projectOfPath(abs) {
   return m ? canonicalProjectName(m[1]) : null;
 }
 function assertPathAccess(identity, abs, right) {
+  memoryAdmissionFor(identity).admit(abs)();
+  try { abs = fs.realpathSync(abs); } catch {}
   const project = projectOfPath(abs);
   assertCan(identity, right, { project, creator: projectCreatorOf(project) }, project ? 'project ' + project : 'this file');
 }
@@ -6215,6 +6252,21 @@ function rowsCsv(rows) {
   const cell = v => { const s = v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   return [cols.map(cell).join(','), ...rows.map(r => cols.map(c => cell(r[c])).join(','))].join('\r\n') + '\r\n';
 }
+function memoryCallVisible(identity, record) {
+  if (accessLib.seesAll(liveMemoryIdentity(identity))) return true;
+  const c = (record.run || record).caller || {};
+  const keys = [...(c.conversations || []), ...(c.conversation ? [c.conversation] : [])];
+  return keys.every(key => !!index[key] && canDo(identity, 'see', targetOf(key))) &&
+    (!c.project || projectVisible(identity, c.project));
+}
+function memoryProgramVisible(log, identity, name, module) {
+  if (accessLib.seesAll(liveMemoryIdentity(identity))) return true;
+  for (let offset = 0; ; offset += 500) {
+    const page = log.runs(name, module, { limit: 500, offset });
+    if (page.runs.some(r => !memoryCallVisible(identity, r))) return false;
+    if (offset + page.runs.length >= page.total) return true;
+  }
+}
 function programRoute(u, req, res, identity) {
   const log = programLog(), at = u.pathname;
   const q = Object.fromEntries(u.searchParams);
@@ -6222,7 +6274,10 @@ function programRoute(u, req, res, identity) {
   const name = String(q.name || ''), module = String(q.module ?? '');
   if (at === '/api/programs') {
     return json(res, 200, { folder: log.folder, exists: fs.existsSync(log.folder), seq: log.seq, recordAgents: appSettings.programsRecordAgents === true,
-      you: programRater(identity), programs: withMadePrograms(log.programs()) });
+      you: programRater(identity), programs: withMadePrograms(log.programs().filter(p => memoryProgramVisible(log, identity, p.name, p.module))) });
+  }
+  if (at === '/api/programs/program' || at === '/api/programs/compare' || at === '/api/programs/rated') {
+    if (!memoryProgramVisible(log, identity, name, module)) return json(res, 403, { error: 'Program includes sources not shared with you.' });
   }
   if (at === '/api/programs/program') {
     const made = module === MADE_MODULE && madePrograms.get(name);
@@ -6238,10 +6293,14 @@ function programRoute(u, req, res, identity) {
     }
     return json(res, 200, { program: p, versions, seq: log.seq, you: programRater(identity) });
   }
-  if (at === '/api/programs/runs') return json(res, 200, log.runs(name, module, q));
+  if (at === '/api/programs/runs') {
+    const out = log.runs(name, module, q);
+    if (!memoryProgramVisible(log, identity, name, module)) return json(res, 200, { seq: out.seq, total: 0, runs: [], counts: {}, answers: [] });
+    return json(res, 200, out);
+  }
   if (at === '/api/programs/run') {
     const r = log.run(String(q.id || ''));
-    return r ? json(res, 200, { ...r, you: programRater(identity) }) : json(res, 404, { error: 'No such call in the log.' });
+    return r && memoryCallVisible(identity, r) ? json(res, 200, { ...r, you: programRater(identity) }) : json(res, 404, { error: 'No such call in the log.' });
   }
   if (at === '/api/programs/compare') return json(res, 200, log.compare(name, module, String(q.a || ''), String(q.b || '')));
   if (at === '/api/programs/rated') {
@@ -6303,7 +6362,7 @@ function programLiveSend(ev, conns = [...programLiveFollowers]) {
     const client = sseByConn.get(conn);
     if (!client) { programLiveFollowers.delete(conn); continue; }
     let view;
-    try { view = policy.eventView(ev, client.receiver || (client.receiver = receiverFor(client.identity))); }
+    try { view = policy.eventView(ev, receiverFor(eventMemoryIdentity(client))); }
     catch (e) { console.error('[programs-live] ' + e.message); view = null; }
     if (!view) continue;
     const line = view === ev ? (whole ||= 'data: ' + JSON.stringify(ev) + '\n\n') : 'data: ' + JSON.stringify(view) + '\n\n';
@@ -6806,6 +6865,25 @@ async function piExec({ system, input, signal: ownSignal = null, onDelta = null,
 const OFF_WORDS = new Set(['0', 'false', 'no', 'off']);
 const aiPrograms = require('./ai-programs.js').createAiPrograms({
   piExec,
+  modelExec: async (request, options) => {
+    const automatic = options.caller?.automatic === true;
+    const check = () => { if (automatic && !backgroundAllowed('memory')) throw backgroundRefusal('memory'); options.check(); };
+    check();
+    const person = currentIdentity()?.user || usersLib.ownerOf(roster);
+    assertWithinBudget(person);
+    memoryModelHealth.setIdentity(options.settings.provider + '/' + options.settings.model);
+    const permit = memoryModelHealth.begin({ automatic });
+    try {
+      const message = await require('./internal-model').runInternalModel(request, { ...options, check });
+      if (message.usage) fs.appendFileSync(INTERNAL_USAGE_FILE, JSON.stringify({ type: 'message', id: crypto.randomUUID(), parentId: null,
+        timestamp: new Date(message.timestamp || Date.now()).toISOString(), chatteringCategory: 'internal', chatteringPurpose: options.program,
+        chatteringPerson: person.id, message: { ...message, content: [] } }) + '\n', { mode: 0o600 });
+      check(); memoryModelHealth.success(permit); return message;
+    } catch (e) {
+      if (!e.modelCallFailure) memoryModelHealth.release(permit); else memoryModelHealth.failure(permit, e);
+      throw e;
+    }
+  },
   chatPost: (url, body, timeoutMs) => httpJson(url, body, timeoutMs),
   voiceEndpoint: () => ({ url: voiceSetting('voiceModelUrl'), model: voiceSetting('voiceModel'), timeoutMs: (modelCallContext.getStore() || {}).timeoutMs || 60000 }),
   lm: () => {
@@ -6834,7 +6912,10 @@ function aiProgram(name, inputs, { automatic, background, purpose, thinking, tim
   // The stop signal, this call's or the context's: a program's call is a
   // stream, and closing the stream is what stops it.
   const lm = ctx.model && ctx.model.provider && ctx.model.model ? ctx.model.provider + '/' + ctx.model.model : null;
-  return modelCallContext.run(ctx, () => aiPrograms.run(name, inputs, { caller: who, onText, onEvent, signal: ctx.signal || null, lm }));
+  const cold = coldMemoryContext.getStore();
+  if (cold) { cold.guard(); Object.assign(who, cold.caller); }
+  return modelCallContext.run(ctx, () => aiPrograms.run(name, inputs, { caller: who, onText, onEvent, signal: ctx.signal || null, lm,
+    ...(cold ? { memory: { agentDir: PI_AGENT_DIR, env: {}, settings: appSettings, check: cold.guard } } : {}) }));
 }
 
 function abortedModelCall() {
@@ -7116,6 +7197,11 @@ function renderNode(n, depth, parts) {
 }
 
 async function distill(data, emit = () => {}) {
+  if (appSettings.memoryImages) {
+    const built = await memoryFeature.build(data, { caller: { conversation: data.key, user: currentIdentity()?.user?.id } });
+    emit({ type: 'done', note: built.note });
+    return { note: built.note, built };
+  }
   emit({ type: 'status', text: 'Mapping the problem tree…' });
   const full = numberedTranscript(data.messages);
   let prior = null;
@@ -7509,7 +7595,7 @@ async function readLeaf(key) {
   if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.leaf;
   try {
     let leaf = JSON.parse(await fsp.readFile(p, 'utf8'));
-    if (leaf.memoryHash && index[key] && leaf.memoryHash !== index[key].memoryHash) {
+    if ((leaf.v || 1) < 3 && !appSettings.memoryImages && leaf.memoryHash && index[key] && leaf.memoryHash !== index[key].memoryHash) {
       try {
         const cached = JSON.parse(await fsp.readFile(cachePathFor(key), 'utf8'));
         leaf = memoryFingerprint.upgradeLeaf(leaf, index[key], cached);
@@ -7523,6 +7609,12 @@ async function readLeaf(key) {
 
 function leafStateFor(entry, leaf) {
   if (!leaf) return 'missing';
+  if (leaf.v === 3) {
+    if (!appSettings.memoryImages || !entry) return 'stale';
+    try { return leaf.memoryHash === memoryFeature.fingerprint(require('./memory-images').sourceSnapshot(absPathForKey(leaf.key)).revision) ? 'fresh' : 'stale'; }
+    catch { return 'stale'; }
+  }
+  if (appSettings.memoryImages) return 'stale';
   if (leaf.partial) return 'seeded'; // intent lane only (migrated from an old build)
   if ((leaf.v || 1) < LEAF_VERSION) return 'stale'; // older extraction quality — re-extract on the next backfill
   return leaf.memoryHash && entry && leaf.memoryHash === entry.memoryHash ? 'fresh' : 'stale';
@@ -7549,6 +7641,15 @@ async function extractLeaf(key) {
   if (!entry) throw new Error('unknown conversation: ' + key);
   const memoryHash = entry.memoryHash || null; // captured before the call: growth during the job leaves the leaf correctly stale
   const data = JSON.parse(await fsp.readFile(cachePathFor(key), 'utf8'));
+  if (appSettings.memoryImages) {
+    const automatic = !!modelCallContext.getStore()?.automatic;
+    const built = await memoryFeature.build(data, { caller: { conversation: key, user: currentIdentity()?.user?.id, automatic } });
+    built.leaf.host = HOST_NAME; built.leaf.participants = entry.participants || [];
+    await fsp.mkdir(MEMORY_LEAVES_DIR, { recursive: true }); built.guard();
+    await writeFileAtomic(leafPathFor(key), JSON.stringify(built.leaf), { sync: true, guard: built.guard });
+    memoryLeafCache.delete(key);
+    return built.leaf;
+  }
   const messages = data.messages || [];
   const project = projectNameOf(entry.cwd, key);
   const primer = await projectPrimerFor(project);
@@ -7861,7 +7962,7 @@ function epicMemoryPaths(epicId) {
 
 async function epicMemoryInfo(epic) {
   try {
-    const manifest = JSON.parse(await fsp.readFile(epicMemoryPaths(epic.id).manifest, 'utf8'));
+    const manifest = JSON.parse(await readMemoryFile(epicMemoryPaths(epic.id).manifest));
     const entries = (epic.sessionIds || []).filter(id => index[id]).map(key => ({ key, entry: index[key] }));
     return {
       builtAt: manifest.builtAt, stale: manifest.sourceHash !== projectSourceHash({ entries }),
@@ -7874,7 +7975,7 @@ async function epicMemoryDocument(epicId, kind) {
   const paths = epicMemoryPaths(epicId);
   const file = ({ overview: paths.overview, intent: paths.intent, environment: paths.environment, status: paths.status })[kind];
   if (!file) throw new Error('unknown epic memory document');
-  return { epicId, kind, path: file, text: await fsp.readFile(file, 'utf8') };
+  return { epicId, kind, path: file, text: await readMemoryFile(file) };
 }
 
 async function regenerateProjectDocs(project, emit = () => {}) {
@@ -7914,6 +8015,15 @@ async function regenerateEpicDocs(epicId, emit = () => {}) {
 }
 
 async function regenerateDocsCore({ label, entries, paths, existingEpics, discoverCandidates, inputsPath }, emit = () => {}) {
+  if (appSettings.memoryImages && !coldMemoryContext.getStore()) {
+    const selected = entries.filter(({ key }) => accessRules.rules[accessLib.conversationObject(key)]?.mode !== 'listed');
+    const keys = selected.map(r => r.key);
+    const guard = coldGuardForKeys(keys, true);
+    const projects = [...new Set(keys.map(key => targetOf(key).project))];
+    return coldMemoryContext.run({ guard, caller: { conversations: keys, project: projects.length === 1 ? projects[0] : undefined,
+      user: currentIdentity()?.user?.id, automatic: !!modelCallContext.getStore()?.automatic } }, () =>
+      regenerateDocsCore({ label, entries: selected, paths, existingEpics, discoverCandidates, inputsPath }, emit));
+  }
   const project = label;
   emit('Reading memory leaves…', 0, 5);
   // A conversation hidden more narrowly than its project (a rule of its
@@ -7924,8 +8034,10 @@ async function regenerateDocsCore({ label, entries, paths, existingEpics, discov
     .filter(r => r.leaf)
     .sort((a, b) => String(a.leaf.span?.firstTs || '').localeCompare(String(b.leaf.span?.firstTs || '')));
   if (!rows.length) throw new Error('no memory leaves yet — run the leaf backfill first');
+  if (appSettings.memoryImages && rows.some(r => leafStateFor(r.entry, r.leaf) !== 'fresh')) throw new Error('Cold memory requires current source leaves; refresh them first');
   let prev = null;
   try { prev = JSON.parse(await fsp.readFile(paths.manifest, 'utf8')); } catch {}
+  if (appSettings.memoryImages && JSON.stringify([...(prev?.sourceKeys || [])].sort()) !== JSON.stringify(rows.map(r => r.key).sort())) prev = null;
   const prevHashes = (prev && prev.pyramid && prev.pyramid.laneHashes) || {};
   const dated = ts => String(ts || '?').slice(0, 10);
 
@@ -8017,14 +8129,14 @@ async function regenerateDocsCore({ label, entries, paths, existingEpics, discov
   if (environment) writes.push(writeFileAtomic(paths.environment, renderProjectEnvironmentDoc(project, environment, builtAt, sourceHash)));
   if (status) writes.push(writeFileAtomic(paths.status, renderProjectStatusDoc(project, status, builtAt, sourceHash)));
   writes.push(writeFileAtomic(inputsPath, JSON.stringify({
-    project, builtAt, sourceHash, laneHashes, leaves: rows.map(r => ({ key: r.key, state: leafStateFor(r.entry, r.leaf) })),
+    project, sourceKeys: rows.map(r => r.key), builtAt, sourceHash, laneHashes, leaves: rows.map(r => ({ key: r.key, state: leafStateFor(r.entry, r.leaf) })),
     intentQuotes: intentSelected.length, weighedQuotes: weighedQuotes.length,
     tiers: [...tiers.entries()].map(([id, t]) => ({ id, ...t })),
     envFacts: envFacts.length, problems: problemFacts.length,
   })));
   await Promise.all(writes);
   const manifest = {
-    project, builtAt, sourceHash, conversations: rows.length,
+    project, sourceKeys: rows.map(r => r.key), builtAt, sourceHash, conversations: rows.length,
     classifiedMessages: prev && prev.classifiedMessages || 0,
     selectedIntentMessages: intentSelected.length,
     coreIntent: (intent && intent.coreIntent) || (prev && prev.coreIntent) || null,
@@ -8041,7 +8153,7 @@ async function projectMemoryInfo(project, meta = projectMetaFor(project)) {
   if (!meta) return null;
   const paths = projectMemoryPaths(project);
   try {
-    const manifest = JSON.parse(await fsp.readFile(paths.manifest, 'utf8'));
+    const manifest = JSON.parse(await readMemoryFile(paths.manifest));
     return {
       builtAt: manifest.builtAt, stale: manifest.sourceHash !== projectSourceHash(meta),
       conversations: manifest.conversations, classifiedMessages: manifest.classifiedMessages,
@@ -8057,14 +8169,14 @@ async function projectMemoryDocument(project, kind) {
   const paths = projectMemoryPaths(project);
   const file = ({ overview: paths.overview, intent: paths.intent, environment: paths.environment, status: paths.status })[kind];
   if (!file) throw new Error('unknown project memory document');
-  return { project, kind, path: file, text: await fsp.readFile(file, 'utf8') };
+  return { project, kind, path: file, text: await readMemoryFile(file) };
 }
 
 async function areaMemoryDocument(project, rel, kind) {
   const paths = areaMemoryPaths(project, rel);
   const file = ({ overview: paths.overview, intent: paths.intent, environment: paths.environment, status: paths.status })[kind];
   if (!file) throw new Error('unknown area memory document');
-  return { project, area: rel, kind, path: file, text: await fsp.readFile(file, 'utf8') };
+  return { project, area: rel, kind, path: file, text: await readMemoryFile(file) };
 }
 
 // Cheap catalog for the @ palette: every known project plus which of the
@@ -8092,6 +8204,8 @@ function projectMemoryIndex() {
       if (ok) any = true;
     }
     if (!meta && !any) continue;
+    if (!projectVisible(currentIdentity() || ownerIdentity(), name)) continue;
+    if (any) { try { memoryAdmissionFor().admit(paths.manifest)(); } catch { continue; } }
     out.push({
       name,
       title: (projectTitles[name] && projectTitles[name].title) || null,
@@ -8305,6 +8419,7 @@ const activeMemoryLeafKeys = new Set(); // one extraction owner per conversation
 function jobView(job) {
   return {
     id: job.id, type: job.type, key: job.key || null, epicId: job.epicId || null,
+    ...(job.memoryScope ? { memoryScope: true, sessionIds: job.sessionIds } : {}),
     project: job.project || null, parentId: job.parentId || null,
     title: job.title, status: job.status, statusText: job.statusText,
     projects: job.projects || null, // leaf batches span projects: the project view filters on this
@@ -8369,6 +8484,81 @@ function allJobs() {
     .sort((a, b) => b.startedAt - a.startedAt);
 }
 
+function memoryAdmissionFor(identity = currentIdentity() || ownerIdentity()) {
+  return require('./memory-admission').createMemoryAdmission({ notesDir: NOTES_DIR, cacheDir: CACHE_DIR,
+    privateDirs: [CONFIG_DIR, PI_AGENT_DIR, platform.functaiCallsDir()],
+    entries: () => index,
+    files: (key, entry) => [absPathForKey(key), cachePathFor(key), leafPathFor(key), entry.notePath],
+    privileged: () => accessLib.seesAll(liveMemoryIdentity(identity)),
+    authorize: key => assertCan(identity, 'see', targetOf(key), 'memory source'),
+  });
+}
+async function readMemoryFile(file, identity = currentIdentity() || ownerIdentity()) {
+  const check = memoryAdmissionFor(identity).admit(file);
+  assertPathAccess(identity, file, 'see');
+  const text = await fsp.readFile(file, 'utf8');
+  check(); assertPathAccess(identity, file, 'see'); return text;
+}
+function coldGuardForKeys(keys, aggregate = false) {
+  const { modelIdentity } = require('./memory-config');
+  const { sourceSnapshot } = require('./memory-images');
+  const model = modelIdentity(appSettings);
+  const identity = currentIdentity() || ownerIdentity();
+  const sources = keys.map(key => [key, sourceSnapshot(absPathForKey(key)).revision, targetOf(key).project]);
+  const leaves = aggregate ? keys.filter(key => fs.existsSync(leafPathFor(key))).map(key => [key, require('./memory-identity').revision(fs.readFileSync(leafPathFor(key)))]) : [];
+  const automatic = !!modelCallContext.getStore()?.automatic;
+  return () => {
+    if (modelIdentity(appSettings) !== model || !appSettings.memoryImages) throw new Error('Memory configuration changed');
+    if (automatic && !backgroundAllowed('memory')) throw backgroundRefusal('memory');
+    assertWithinBudget(liveMemoryIdentity(identity)?.user);
+    for (const [key, hash] of leaves) if (require('./memory-identity').revision(fs.readFileSync(leafPathFor(key))) !== hash) throw new Error('Memory leaf changed');
+    for (const [key, rev, project] of sources) {
+      if (!index[key]) throw new Error('Memory source removed');
+      assertCan(identity, 'act', targetOf(key), 'memory');
+      if (targetOf(key).project !== project || sourceSnapshot(absPathForKey(key)).revision !== rev ||
+          (aggregate && accessRules.rules[accessLib.conversationObject(key)]?.mode === 'listed')) throw new Error('Memory source or eligibility changed');
+    }
+  };
+}
+const memoryFeature = require('./memory-feature').createMemoryFeature({
+  settings: () => appSettings, programs: aiPrograms, sourceFile: absPathForKey,
+  projectOf: key => index[key] ? projectNameOf(index[key].cwd, key) : null,
+  transport: () => ({ agentDir: PI_AGENT_DIR, env: {}, timeoutMs: 120000 }),
+  authorize({ key, automatic }) {
+    if (!index[key] || !appSettings.memoryImages) throw new Error('Image memory source or opt-in unavailable');
+    if (automatic && !backgroundAllowed('memory')) throw backgroundRefusal('memory');
+    const identity = currentIdentity() || ownerIdentity();
+    assertCan(identity, 'act', targetOf(key), 'memory');
+    assertWithinBudget(liveMemoryIdentity(identity)?.user);
+  },
+});
+async function publishColdNote(key, data, built) {
+  built.guard();
+  await fsp.mkdir(NOTES_DIR, { recursive: true });
+  // A source-owned name avoids title collisions and replacing unrelated/human notes.
+  const file = path.join(NOTES_DIR, 'memory-' + require('./memory-identity').revision(key) + '.md');
+  const existing = index[key]?.notePath;
+  if (existing && path.resolve(existing) !== file) throw new Error('Existing note requires explicit reconciliation; not overwritten');
+  let before = null;
+  try {
+    if (fs.lstatSync(file).isSymbolicLink() || existing !== file) throw new Error('Memory note ownership unavailable');
+    before = fs.readFileSync(file);
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const noteGuard = () => {
+    built.guard();
+    if (index[key]?.notePath !== existing || Object.entries(index).some(([k, e]) => k !== key && e.notePath === file)) throw new Error('Memory note ownership changed');
+    if (before === null) { if (fs.existsSync(file)) throw new Error('Memory note appeared during publication'); }
+    else if (fs.lstatSync(file).isSymbolicLink() || !fs.readFileSync(file).equals(before)) throw new Error('Memory note changed during publication');
+  };
+  await writeFileAtomic(file, built.note, { sync: true, guard: noteGuard });
+  built.guard(); index[key].notePath = file; index[key].notedAt = data.mtimeMs; saveIndexSoon();
+  built.leaf.host = HOST_NAME; built.leaf.participants = index[key].participants || [];
+  await fsp.mkdir(MEMORY_LEAVES_DIR, { recursive: true });
+  await writeFileAtomic(leafPathFor(key), JSON.stringify(built.leaf), { sync: true, guard: built.guard });
+  memoryLeafCache.delete(key); built.guard();
+  return file;
+}
+
 function startDistillJob(key, data, options = {}) {
   // Capture the source version now. If the conversation grows while this job
   // runs, its final note remains correctly marked as stale.
@@ -8393,7 +8583,12 @@ function startDistillJob(key, data, options = {}) {
   };
   job.completion = (async () => {
     try {
-      const { note } = await distill(data, emit);
+      const { note, built } = await distill(data, emit);
+      if (built) {
+        const file = await publishColdNote(key, data, built);
+        emit({ type: 'saved', notePath: file, title: data.title });
+        return;
+      }
       emit({ type: 'status', text: 'Titling and saving…' });
       let title = null, abstract = null;
       try {
@@ -8435,10 +8630,11 @@ function startMemoryExtractJob(ids, label = null, options = {}) {
   const automatic = !!options.automatic;
   const keys = [...new Set(ids)].filter(k => index[k] && !activeMemoryLeafKeys.has(k) && memoryModelHealth.canRunLeaf(k, { automatic }));
   if (!keys.length) throw new Error('no memory leaves are ready to extract');
+  if (appSettings.memoryImages) coldGuardForKeys(keys)();
   const id = crypto.randomUUID();
   const job = {
     id: 'memory-extract:' + id, type: 'memory-extract',
-    key: keys.length === 1 ? keys[0] : null, sessionIds: keys,
+    key: keys.length === 1 ? keys[0] : null, sessionIds: keys, memoryScope: appSettings.memoryImages,
     title: label || `${keys.length} memory ${keys.length === 1 ? 'leaf' : 'leaves'}`,
     projects: [...new Set(keys.map(k => projectNameOf(index[k].cwd, k)))],
     status: 'running', statusText: 'Extracting memory leaves…', done: 0, total: keys.length,
@@ -8517,10 +8713,13 @@ function startEpicDocsJob(epicId, options = {}) {
 }
 
 function startDocsJobCore(mapKey, title, project, epicId, run, options = {}) {
+  const sourceKeys = appSettings.memoryImages ? (epicId ? epics[epicId]?.sessionIds || [] : projectMetaFor(project)?.entries.map(r => r.key) || [])
+    .filter(key => accessRules.rules[accessLib.conversationObject(key)]?.mode !== 'listed') : null;
+  if (sourceKeys) coldGuardForKeys(sourceKeys, true)();
   const running = memoryDocsJobs.get(mapKey);
   if (running && !running.finished) return running;
   const job = {
-    id: 'memory-docs:' + mapKey, type: 'memory-docs', project, epicId,
+    id: 'memory-docs:' + mapKey, type: 'memory-docs', project, epicId, memoryScope: !!sourceKeys, sessionIds: sourceKeys,
     title, status: 'running', statusText: 'Reading memory leaves…',
     done: 0, total: 5, startedAt: Date.now(), finished: false, model: currentModelLabel(),
   };
@@ -8552,12 +8751,15 @@ function startDocsJobCore(mapKey, title, project, epicId, run, options = {}) {
 // The one-time backfill for old projects: oldest first, resumable (finished
 // leaves persist), pausable. Regenerates the documents once at the end.
 function startMemoryBackfillJob(project) {
-  const running = memoryBackfillJobs.get(project);
-  if (running && !running.finished) return running;
   const meta = projectMetaFor(project);
   if (!meta) throw new Error('project not found');
+  const sourceKeys = meta.entries.filter(r => !syncLib.isMirrorKey(r.key)).map(r => r.key);
+  if (appSettings.memoryImages) coldGuardForKeys(sourceKeys)();
+  const running = memoryBackfillJobs.get(project);
+  if (running && !running.finished) return running;
   const job = {
     id: 'memory-backfill:' + project, type: 'memory-backfill', project,
+    memoryScope: appSettings.memoryImages, sessionIds: sourceKeys,
     title: `${project}: memory leaf backfill`, status: 'running', statusText: 'Checking leaves…',
     done: 0, total: 0, startedAt: Date.now(), finished: false, model: currentModelLabel(),
     cancelRequested: false,
@@ -12321,7 +12523,10 @@ async function transcriptFilePath(key, pathValue, maxBytes = 32 * 1024 * 1024, l
 
 async function transcriptFileReadResponse(key, pathValue, local = false) {
   const { abs } = await transcriptFilePath(key, pathValue, FILE_EDIT_MAX, local);
+  const check = memoryAdmissionFor().admit(abs);
+  assertPathAccess(currentIdentity() || ownerIdentity(), abs, 'see');
   const body = await fsp.readFile(abs);
+  check();
   if (body.subarray(0, 8192).includes(0)) throw new Error('this is a binary file');
   const text = body.toString('utf8');
   return { path: abs, text, sha: sha256Hex(text) };
@@ -12466,7 +12671,7 @@ async function nativePathAction(key, pathValue, action) {
 
 async function fileReadResponse(pathValue, key = '', reviewId = '') {
   const abs = reviewId ? await editableReviewFile(pathValue, reviewId) : await editableFilePath(pathValue, key);
-  const text = await fsp.readFile(abs, 'utf8');
+  const text = await readMemoryFile(abs);
   const historyWarning = observeFileHistory(abs, { text, source: 'opened file' });
   return { path: abs, text, sha: sha256Hex(text), historyWarning };
 }
@@ -16635,7 +16840,12 @@ async function handleRequest(req, res) {
           })
         : await legacySearch(q);
       // Conversation groups carry fresh index metadata (titles can change).
-      out.groups = out.groups.filter(g => !g.key || keyVisible(identity, g.key));
+      out.groups = out.groups.filter(g => searchGroupVisible(identity, g));
+      // Global index counts include hidden sources. Expose only admitted-page counts.
+      out.total = out.groups.reduce((n, g) => n + (g.matchCount || 0), 0);
+      out.groupCount = out.groups.length;
+      out.kindCounts = {};
+      for (const g of out.groups) out.kindCounts[g.kind] = (out.kindCounts[g.kind] || 0) + 1;
       for (const g of out.groups) {
         if (g.key && index[g.key]) {
           const e = index[g.key];
@@ -16653,7 +16863,7 @@ async function handleRequest(req, res) {
       const t0 = Date.now();
       try {
         const r = await semFetch('/search', { ns: semNs(), q, limit: 30 }, 8000);
-        json(res, 200, { q, semantic: true, tookMs: Date.now() - t0, groups: semanticGroups(r.hits || []).filter(g => !g.key || keyVisible(identity, g.key)) });
+        json(res, 200, { q, semantic: true, tookMs: Date.now() - t0, groups: semanticGroups((r.hits || []).filter(h => searchGroupVisible(identity, h.meta || {}))) });
       } catch (e) {
         json(res, 200, { q, semantic: true, groups: [], error: 'semantic stage unreachable' });
       }
@@ -16990,7 +17200,9 @@ async function handleRequest(req, res) {
       } catch (e) { json(res, 400, { error: e.message }); }
     } else if (u.pathname === '/api/file/read' && req.method === 'GET') {
       try {
+        const admitted = memoryAdmissionFor(identity).admit(expandHomePath(u.searchParams.get('path') || ''));
         const out = await fileReadResponse(u.searchParams.get('path') || '', u.searchParams.get('id') || '', u.searchParams.get('reviewId') || '');
+        admitted();
         assertPathAccess(identity, out.path, 'see');
         out.canAct = canDo(identity, 'act', { project: projectOfPath(out.path), creator: projectCreatorOf(projectOfPath(out.path)) });
         json(res, 200, out);
@@ -17078,8 +17290,12 @@ async function handleRequest(req, res) {
     } else if (u.pathname === '/api/memory/leaf' && req.method === 'GET') {
       const key = u.searchParams.get('id') || '';
       if (!index[key]) return json(res, 404, { error: 'not found' });
-      const leaf = await readLeaf(key);
-      json(res, 200, { key, state: leafStateFor(index[key], leaf), leaf });
+      try {
+        assertCan(identity, 'see', targetOf(key), 'memory');
+        const check = memoryAdmissionFor(identity).admit(leafPathFor(key));
+        const leaf = await readLeaf(key); check();
+        json(res, 200, { key, state: leafStateFor(index[key], leaf), leaf });
+      } catch (e) { json(res, e.status || 400, { error: e.message }); }
     } else if (u.pathname === '/api/project/memory/regenerate' && req.method === 'POST') {
       let body = '';
       for await (const chunk of req) body += chunk;
@@ -17639,6 +17855,7 @@ async function handleRequest(req, res) {
       try {
         const p = await programBody(req, 16384), log = programLog();
         log.refresh();
+        if (!memoryProgramVisible(log, identity, String(p.name || ''), String(p.module ?? ''))) return json(res, 403, { error: 'Program includes sources not shared with you.' });
         json(res, 200, log.sample(String(p.name || ''), String(p.module ?? ''), { n: p.n, version: p.version || null, unrated: p.unrated !== false }));
       } catch (e) { json(res, e.status || 400, { error: e.message }); }
     } else if (u.pathname === '/api/programs/rate' && req.method === 'POST') {
@@ -18291,7 +18508,9 @@ async function handleRequest(req, res) {
       }
       const prevSemTarget = (appSettings.semanticUrl || '') + '|' + semNs();
       const prevLan = lanWanted();
-      appSettings = settingsLib.applyResolvedContext(parsed, listed, piDefault);
+      const next = settingsLib.applyResolvedContext(parsed, listed, piDefault);
+      if (next.memoryImages) { try { require('./memory-config').memoryConfig(next); } catch (e) { return json(res, 400, { error: e.message }); } }
+      appSettings = next;
       saveAppSettings();
       reapplyGuestLimits();
       if (lanWanted() !== prevLan) {
@@ -19183,26 +19402,33 @@ async function handleRequest(req, res) {
     } else if (u.pathname === '/api/distill-stream') {
       const key = u.searchParams.get('id');
       if (!key || !index[key]) return json(res, 404, { error: 'not found' });
+      const admitted = () => {
+        const live = identifyRequest(req);
+        return !!live && !!index[key] && canDo(live, 'see', targetOf(key));
+      };
+      if (!admitted()) return json(res, 403, { error: 'This conversation is not shared with you.' });
       const data = JSON.parse(await fsp.readFile(cachePathFor(key), 'utf8'));
+      if (!admitted()) return json(res, 403, { error: 'This conversation is not shared with you.' });
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
       });
+      let job = distillJobs.get(key), closed = false;
+      const detach = () => { closed = true; job?.listeners.delete(send); };
       const send = ev => {
+        if (closed) return;
+        if (!admitted()) { detach(); res.end(); return; }
         res.write('data: ' + JSON.stringify(ev) + '\n\n');
-        if (ev.type === 'saved' || ev.type === 'error') res.end();
+        if (ev.type === 'saved' || ev.type === 'error') { detach(); res.end(); }
       };
-      let job = distillJobs.get(key);
+      req.on('close', detach);
       const force = u.searchParams.get('force') === '1';
       if (!job || (job.finished && (force || job.events.some(e => e.type === 'error')))) {
         job = startDistillJob(key, data);
       }
       for (const ev of job.events) send(ev); // replay for reconnecting tabs
-      if (!job.finished) {
-        job.listeners.add(send);
-        req.on('close', () => job.listeners.delete(send));
-      }
+      if (!job.finished && !closed) job.listeners.add(send);
     } else if (u.pathname === '/api/events') {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -19213,7 +19439,7 @@ async function handleRequest(req, res) {
       // This stream names the browser for presence: the page reports where
       // it is under this id, and the row goes when the stream closes.
       const conn = crypto.randomBytes(8).toString('hex');
-      sseByConn.set(conn, { res, identity, conn });
+      sseByConn.set(conn, { res, identity, conn, proof: { isLocal: isLocalRequest(req), cookie: signInCookie(req), authorization: req.headers.authorization } });
       try { res.write('data: ' + JSON.stringify({ type: 'hello', conn, me: usersLib.publicUser(identity.user), tier: identity.tier, users: publicUsers(), people: presenceFor(identity, conn) }) + '\n\n'); } catch {}
       // Seed the working-agent set right away: the periodic diff below only
       // broadcasts on change, so a fresh client would otherwise start blind.
@@ -19254,8 +19480,8 @@ async function handleRequest(req, res) {
       const f = u.searchParams.get('f') || '';
       const abs = path.resolve(NOTES_DIR, f);
       if (!f.endsWith('.md') || !abs.startsWith(NOTES_DIR + path.sep)) return json(res, 400, { error: 'bad name' });
-      try { json(res, 200, { file: path.relative(NOTES_DIR, abs), text: await fsp.readFile(abs, 'utf8') }); }
-      catch { json(res, 404, { error: 'not found' }); }
+      try { json(res, 200, { file: path.relative(NOTES_DIR, abs), text: await readMemoryFile(abs, identity) }); }
+      catch (e) { json(res, e.status || 404, { error: e.message }); }
     } else if (u.pathname === '/api/distill/save' && req.method === 'POST') {
       let body = '';
       for await (const chunk of req) body += chunk;
@@ -19273,8 +19499,8 @@ async function handleRequest(req, res) {
       const e = index[key];
       if (!e || !e.notePath) return json(res, 404, { error: 'no note' });
       try {
-        json(res, 200, { notePath: e.notePath, text: await fsp.readFile(e.notePath, 'utf8') });
-      } catch { json(res, 404, { error: 'note file missing' }); }
+        json(res, 200, { notePath: e.notePath, text: await readMemoryFile(e.notePath, identity) });
+      } catch (e) { json(res, e.status || 404, { error: e.message }); }
     } else if (u.pathname === '/api/sso/check' && req.method === 'POST') {
       // Before saving company sign-in: does that issuer answer as one?
       let body = '';
