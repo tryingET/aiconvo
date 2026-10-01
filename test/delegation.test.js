@@ -8,6 +8,7 @@ const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const D = require('../delegation');
 const S = require('../delegation-store');
+const P = require('../processes');
 const { resultParser } = require('../delegation-supervisor');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // explain(): what to add to a timeout's message, so a slow system's failure names its cause.
@@ -100,8 +101,24 @@ async function fixture(t) {
       if (!S.TERMINAL.has(task.status)) await D.controlDelegation(id, 'cancel', options);
     }
     await until(async () => (await D.listDelegations(options)).every(t => S.TERMINAL.has(t.status)));
-    await sleep(100);
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Terminal publication precedes the supervisor's finally/stdio close and exit.
+    // Join both identities, including a lost worker; saved PIDs authorize no kill.
+    await until(async () => {
+      const tasks = await D.listDelegations(options);
+      let joined = true;
+      for (const task of tasks) {
+        if (/descendant outcome is unknown/.test(task.error || '')) throw new Error(task.error + '\nRetaining fixture: ' + dir);
+        if (!S.TERMINAL.has(task.status)) joined = false;
+        for (const owner of [task.supervisorIdentity, task.processIdentity]) {
+          if (!owner) continue;
+          const alive = S.sameProcess(owner), problem = P.identityProblem();
+          if (problem) throw new Error(problem + '\nRetaining fixture: ' + dir);
+          if (alive) joined = false;
+        }
+      }
+      return joined;
+    }, 8000, () => 'fixture processes to exit before removal: ' + dir);
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   return { dir, root, parent, fake, mode, options, spec, launch: patch => D.launchDelegation({ ...spec, ...patch }, options),
     // A worker's whole run: up to thirty seconds on a slow machine, with the task's account on failure.
