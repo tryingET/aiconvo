@@ -131,7 +131,7 @@ function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onTh
     try {
       child = spawn(process.execPath, [path.join(__dirname, 'internal-model-supervisor.js'), path.join(__dirname, 'internal-model-worker.js')],
         { cwd, env, detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
-      try { anchor = owner.anchor(child.pid); } catch {}
+      try { anchor = owner.anchor(child.pid, Date.now() + Math.min(timeoutMs, 10000)); } catch {}
     } catch (e) { clearTimeout(timer); reject(e); return; }
     const send = packet => { if (child.connected) child.send(packet, e => { if (e) stop(e); }); else stop(new Error('Memory IPC disconnected')); };
     child.on('message', packet => {
@@ -153,7 +153,7 @@ function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onTh
     child.once('close', async () => {
       clearTimeout(timer); clearTimeout(escalation); signal?.removeEventListener('abort', abort);
       await chain;
-      const alive = () => owner.alive(anchor);
+      const alive = () => owner.alive(anchor, deadline);
       let clean = false;
       try {
         for (let i = 0; i < 30; i++) {

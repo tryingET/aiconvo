@@ -290,7 +290,15 @@ function usage(pid) {
 
 // Memory cleanup needs fresh, fail-closed ownership records, not Windows'
 // background discovery snapshot or a null that might mean a failed ps query.
-function ownershipList() {
+// PowerShell startup/WMI can exceed two seconds on a busy native runner.
+// Every current query is bounded by the caller's remaining cleanup budget,
+// not discovery's cache or a fresh timeout per process.
+function windowsOwnershipTimeout(deadline) {
+  const left = Math.floor(deadline - Date.now());
+  if (left <= 0) throw Object.assign(new Error('Process ownership deadline exceeded'), { code: 'ETIMEDOUT' });
+  return Math.min(10000, left);
+}
+function ownershipList({ deadline = Infinity } = {}) {
   if (PLATFORM === 'linux') return linuxList().flatMap(p => {
     const record = ownership(p.pid); return record ? [{ ...record, argv: p.argv }] : [];
   });
@@ -302,10 +310,10 @@ function ownershipList() {
     });
   }
   if (PLATFORM === 'win32') return parseWinList(execFileSync(POWERSHELL, psArgs(WIN_LIST_SCRIPT),
-    { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }));
+    { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: windowsOwnershipTimeout(deadline), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }));
   throw new Error('Current process ownership unavailable');
 }
-function ownership(pid) {
+function ownership(pid, { deadline = Infinity } = {}) {
   if (PLATFORM === 'linux') {
     let fields;
     try { const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); fields = stat.slice(stat.lastIndexOf(')') + 2).split(' '); }
@@ -335,7 +343,7 @@ function ownership(pid) {
       (!winBoot || winBoot === 'unknown' ? WIN_BOOT_SCRIPT : '');
     let lines;
     try {
-      lines = execFileSync(POWERSHELL, psArgs(script), { encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
+      lines = execFileSync(POWERSHELL, psArgs(script), { encoding: 'utf8', timeout: windowsOwnershipTimeout(deadline), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
     } catch (error) {
       // A process can exit during the query. Only a fresh kernel ESRCH proves
       // absence; live, reused, denied or otherwise uncertain PIDs still fail.
