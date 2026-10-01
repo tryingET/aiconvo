@@ -527,15 +527,18 @@ test('Given native ICE before SDP, When a phone connects, Then descriptions prec
 });
 
 
-// Delayed native platform promises reproduce callbacks which overlap on the
-// home's real relay handler. SDP/ICE bytes, relay and authentication are real.
+// Delay native SDP while genuine phone ICE gathers. Offer receipt/gathering
+// releases the setter, not an ICE message correctly withheld until the answer.
+// Early legacy-candidate overlap is separately checked by the home contract
+// regression; SDP/ICE bytes, relay and authentication below remain real.
 for (const scenario of ['pairs', 'has a wrong code', 'reaches a different home']) {
   const refusal = scenario === 'has a wrong code', forged = scenario === 'reaches a different home';
   test(`Given delayed native home SDP, When the phone ${scenario}, Then home signals remain ordered`, { skip, timeout: 30000 }, async t => {
     const Native = rtc.RTCPeerConnection;
     const events = [], errors = [];
-    let homePeer, receivedCandidate;
-    const candidateReceived = new Promise(r => { receivedCandidate = r; });
+    let homePeer, receivedOffer, gatheredPhone;
+    const offerReceived = new Promise(r => { receivedOffer = r; });
+    const phoneGathered = new Promise(r => { gatheredPhone = r; });
     let releaseRemote;
     const remoteRelease = new Promise(r => { releaseRemote = r; });
     class DelayedHome extends Native {
@@ -570,7 +573,7 @@ for (const scenario of ['pairs', 'has a wrong code', 'reaches a different home']
         super.onmessage = ev => {
           const m = JSON.parse(ev.data);
           const result = fn(ev);
-          if (m.t === 'signal' && m.data.candidate) receivedCandidate();
+          if (m.t === 'signal' && m.data.sdp) receivedOffer();
           return result;
         };
       }
@@ -592,13 +595,19 @@ for (const scenario of ['pairs', 'has a wrong code', 'reaches a different home']
         return super.send(JSON.stringify(m));
       }
     }
+    class GatheringPhone extends Native {
+      constructor(config) {
+        super(config);
+        this.addEventListener('icecandidate', event => { if (event.candidate) gatheredPhone(); });
+      }
+    }
     const connecting = w.phone({ homeId: forged ? P.b64u(P.random(16)) : link.homeId,
-      device: await newDevice(), RTCPeerConnection: Native, WebSocket: PhoneSocket,
+      device: await newDevice(), RTCPeerConnection: GatheringPhone, WebSocket: PhoneSocket,
       pairing: { id: link.id, secret: refusal ? P.b64u(P.random(16)) : link.secret }, signal: abort.signal });
     const outcome = connecting.then(tunnel => ({ tunnel }), error => ({ error }));
-    await candidateReceived;
+    await Promise.all([offerReceived, phoneGathered]);
     assert.ok(homePeer, 'actual home peer constructed');
-    // Callback arrival, not timing, controls when the native SDP is applied.
+    // Native gathering and callback arrival, not elapsed time, control release.
     releaseRemote();
     const result = await outcome;
     if (forged) {

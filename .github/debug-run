@@ -1,2 +1,2 @@
 ["ubuntu-latest","macos-latest","windows-latest"]
-test/conversation-app.test.js test/process-cleanup-join.test.js test/localmachines-browser-cleanup.test.js test/localmachines-cleanup.test.js test/localmachines-server.test.js test/fixture-cleanup.test.js test/private-file-writer-lifecycle.test.js test/private-file-rename-abi.test.js test/private-file-native.test.js test/private-file.test.js test/private-file-races.test.js test/test-runner-trace.test.js
+test/anywhere-client-readiness.test.js test/anywhere-home-signal-readiness.test.js test/anywhere.test.js test/anywhere-browser.test.js test/anywhere-server.test.js test/anywhere-links-server.test.js test/anywhere-identity-init.test.js test/private-file-publication.test.js test/private-file-native.test.js

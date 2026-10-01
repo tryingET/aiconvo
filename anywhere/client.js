@@ -28,6 +28,25 @@
   const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
   const signalUrl = relay => String(relay).replace(/\/+$/, '').replace(/^http/, 'ws') + '/signal';
 
+  // Move gathered offer candidates to trickle messages without changing any
+  // other SDP byte. Keep each candidate's media section, including a mid that
+  // appears later in that section, and preserve completion indications.
+  function wireOffer(sdp) {
+    const wire = [], found = [];
+    let index = -1, section = { index: null, mid: null };
+    for (const raw of sdp.match(/[^\r\n]*(?:\r\n|\r|\n|$)/g) || []) {
+      if (!raw) continue;
+      const line = raw.replace(/[\r\n]+$/, '');
+      if (line.startsWith('m=')) section = { index: ++index, mid: null };
+      if (line.startsWith('a=mid:')) section.mid = line.slice(6);
+      if (line.startsWith('a=candidate:')) found.push({ candidate: line.slice(2), section });
+      else if (line === 'a=end-of-candidates') found.push({ candidate: '', section });
+      else wire.push(raw);
+    }
+    return { sdp: wire.join(''), candidates: found.map(x => ({ candidate: x.candidate,
+      sdpMid: x.section.mid, sdpMLineIndex: x.section.index })) };
+  }
+
   function connect(opts) {
     const RTC = opts.RTCPeerConnection || (typeof RTCPeerConnection !== 'undefined' ? RTCPeerConnection : null);
     const WS = opts.WebSocket || (typeof WebSocket !== 'undefined' ? WebSocket : null);
@@ -37,11 +56,12 @@
     return new Promise((resolve, reject) => {
       let ws = null, pc = null, dc = null, mux = null, done = false, timer = null;
       let homeHello = null, proof = null, phoneNonce = P.b64u(P.random(16));
-      const pendingCandidates = [], localCandidates = [];
-      let remoteReady = false, offerSent = false, signals = Promise.resolve();
+      const pendingCandidates = [], localCandidates = [], localSeen = new Set();
+      let remoteReady = false, offerSent = false, publishingCandidates = false, signals = Promise.resolve();
       const finish = (err, tunnel) => {
         if (done) return;
         done = true;
+        pendingCandidates.length = 0; localCandidates.length = 0; localSeen.clear();
         clearTimeout(timer);
         if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
         // The relay's part ends once the tunnel stands: nothing more to pass.
@@ -54,6 +74,28 @@
       const arm = () => { clearTimeout(timer); timer = setTimeout(() => finish(fail(pc ? 'failed' : 'relay', pc ? 'no network path to your computer' : 'the relay did not answer')), timeoutMs); };
       arm();
       const send = m => { try { ws.send(JSON.stringify(m)); } catch {} };
+      function publishCandidates() {
+        if (done || !offerSent || !remoteReady || publishingCandidates) return;
+        publishingCandidates = true;
+        try {
+          while (!done && offerSent && remoteReady && localCandidates.length) send(localCandidates.shift());
+        } finally { publishingCandidates = false; }
+      }
+      function queueCandidate(candidate) {
+        if (done) return;
+        const c = { candidate: String(candidate?.candidate || '').replace(/^a=/, ''),
+          sdpMid: candidate?.sdpMid ?? null, sdpMLineIndex: candidate?.sdpMLineIndex ?? null };
+        const key = JSON.stringify(c);
+        if (localSeen.has(key)) return;
+        localSeen.add(key);
+        const message = { t: 'signal', data: { candidate: c } };
+        // Reentrant gathering must not overtake older candidates or publish
+        // gathering completion before a newly queued real candidate.
+        const completion = localCandidates.findIndex(m => m.data.candidate.candidate === '');
+        if (c.candidate && completion >= 0) localCandidates.splice(completion, 0, message);
+        else localCandidates.push(message);
+        publishCandidates();
+      }
 
       status('relay');
       try { ws = new WS(signalUrl(opts.relay)); } catch (e) { return finish(fail('relay', e.message)); }
@@ -80,9 +122,13 @@
           signals = signals.then(async () => {
             if (done) return;
             if (m.data.sdp) {
+              remoteReady = false;
               await pc.setRemoteDescription(m.data.sdp);
               if (done) return;
               remoteReady = true;
+              // Both peers now have the other's fingerprint. Releasing phone
+              // ICE earlier can start native DTLS before the answer is applied.
+              publishCandidates();
               for (const c of pendingCandidates.splice(0)) {
                 if (done) return; // abort/failure can close the peer during the previous await
                 await pc.addIceCandidate(c).catch(() => {});
@@ -105,11 +151,12 @@
         dc = pc.createDataChannel('tunnel', { ordered: true });
         dc.binaryType = 'arraybuffer';
         pc.onicecandidate = e => {
-          if (!e.candidate || done) return;
-          const m = { t: 'signal', data: { candidate: { candidate: String(e.candidate.candidate).replace(/^a=/, ''), sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex } } };
-          // Native gathering can run before createOffer() resolves. The home
-          // needs the offer to create its peer before it can take candidates.
-          if (offerSent) send(m); else localCandidates.push(m);
+          if (done) return;
+          // Native gathering can precede offer publication or answer receipt.
+          // Keep every phone candidate private until the answer is applied;
+          // otherwise the home can initiate ICE/DTLS before its fingerprint is
+          // installed at this end. The native upstream may run those on threads.
+          queueCandidate(e.candidate); // null is a gathering-complete marker
         };
         pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') finish(fail('failed', 'no network path to your computer')); };
         dc.onopen = () => {
@@ -124,9 +171,15 @@
           if (done) return;
           await pc.setLocalDescription(offer);
           if (done) return;
-          send({ t: 'signal', data: { sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } } });
+          // A mutable localDescription can already contain gathered ICE.
+          // Withhold those candidates only from the wire offer, preserving the
+          // native SDP and every fingerprint/credential/media line unchanged.
+          const local = pc.localDescription;
+          const wire = wireOffer(local.sdp);
+          for (const candidate of wire.candidates) queueCandidate(candidate);
+          send({ t: 'signal', data: { sdp: { type: local.type, sdp: wire.sdp } } });
           offerSent = true;
-          for (const m of localCandidates.splice(0)) send(m);
+          publishCandidates();
         } catch (e) { finish(fail('failed', e.message)); }
       }
 
