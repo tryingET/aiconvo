@@ -1,2 +1,2 @@
-["windows-latest"]
-test/private-file-writer-lifecycle.test.js test/private-file-rename-abi.test.js test/private-file-native.test.js test/private-file.test.js test/private-file-races.test.js test/test-runner-trace.test.js
+["ubuntu-latest","macos-latest","windows-latest"]
+test/conversation-app.test.js test/process-cleanup-join.test.js test/localmachines-browser-cleanup.test.js test/localmachines-cleanup.test.js test/localmachines-server.test.js test/fixture-cleanup.test.js test/private-file-writer-lifecycle.test.js test/private-file-rename-abi.test.js test/private-file-native.test.js test/private-file.test.js test/private-file-races.test.js test/test-runner-trace.test.js

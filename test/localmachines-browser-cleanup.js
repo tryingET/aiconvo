@@ -2,6 +2,10 @@
 const { stopAndRemove } = require('./helpers/cleanup');
 
 function gracefulExit(browser, ws, closeBrowser, graceMs) {
+  const start = Date.now();
+  const trace = (event, detail = {}) => {
+    if (process.env.CHATTERING_TEST_TRACE === '1') console.log('BROWSER-SHUTDOWN', JSON.stringify({ event, elapsedMs: Date.now() - start, pid: browser.pid, ...detail }));
+  };
   return new Promise((resolve, reject) => {
     let settled = false, disconnected = false;
     const finish = error => {
@@ -10,12 +14,13 @@ function gracefulExit(browser, ws, closeBrowser, graceMs) {
       browser.removeListener('exit', onExit);
       ws?.removeEventListener('close', onDisconnect);
       ws?.removeEventListener('error', onDisconnect);
+      trace('graceful settled', { error: error?.message, exitCode: browser.exitCode, signalCode: browser.signalCode });
       if (error) reject(error); else resolve();
     };
     const onExit = (code, signal) => finish(code === 0 && !signal ? null : new Error(`browser exited code=${code}, signal=${signal}`));
     // Chrome can drop CDP *before* normal exit. Still allow that exit within
     // the bounded window, but retain disconnect diagnostics if it never comes.
-    const onDisconnect = () => { disconnected = true; };
+    const onDisconnect = event => { disconnected = true; trace('CDP ' + event.type); };
     const timer = setTimeout(() => finish(new Error('graceful window expired' + (disconnected ? ' after CDP disconnected' : ' without browser exit'))), graceMs);
     browser.once('exit', onExit);
     ws?.addEventListener('close', onDisconnect);
@@ -23,7 +28,9 @@ function gracefulExit(browser, ws, closeBrowser, graceMs) {
     if (!closeBrowser || ws?.readyState !== 1) return finish(new Error('CDP unavailable/disconnected'));
     try {
       // Never await the reply: a normal exit is proof even without one.
+      trace('Browser.close request');
       Promise.resolve(closeBrowser()).then(reply => {
+        trace('Browser.close reply', { error: reply?.error });
         if (reply?.error) finish(new Error('CDP Browser.close failed: ' + (reply.error.message || JSON.stringify(reply.error))));
       }, error => finish(error));
     } catch (error) { finish(error); }
