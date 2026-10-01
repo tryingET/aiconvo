@@ -18,6 +18,7 @@ function extract(source, start, end) {
   assert.ok(a >= 0 && b > a, start);
   return source.slice(a, b);
 }
+const streamRequire = specifier => { assert.equal(specifier, 'node:stream'); return require(specifier); };
 const textOf = content => typeof content === 'string' ? content : (content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
 
 async function parseAll(t, lines) {
@@ -25,20 +26,26 @@ async function parseAll(t, lines) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'session.jsonl');
   fs.writeFileSync(file, lines.map(l => JSON.stringify(l)).join('\n'));
-  const box = vm.createContext({ fs, readline, usageLib, settingsLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
+  const box = vm.createContext({ fs, readline, require: streamRequire, usageLib, settingsLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
     toolEventsOf: () => [], directImagesOf: () => [], pathCandidates: () => [], isNoise: () => false });
-  vm.runInContext(extract(serverSource, 'async function parseFile(absPath) {', '\nasync function transcriptImage('), box);
-  return JSON.parse(JSON.stringify(await box.parseFile(file)));
+  vm.runInContext(extract(serverSource, 'async function parseFile(', '\nasync function transcriptImage('), box);
+  const parsed = JSON.parse(JSON.stringify(await box.parseFile(file)));
+  const captured = JSON.parse(JSON.stringify(await box.parseFile(file + '.not-on-disk', fs.readFileSync(file, 'utf8'))));
+  assert.deepEqual(captured, parsed, 'captured text preserves the entire branch/context record');
+  return parsed;
 }
 async function parse(t, lines) {
   const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'context-fill-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'session.jsonl');
   fs.writeFileSync(file, lines.map(l => JSON.stringify(l)).join('\n'));
-  const box = vm.createContext({ fs, readline, usageLib, settingsLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
+  const box = vm.createContext({ fs, readline, require: streamRequire, usageLib, settingsLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
     toolEventsOf: () => [], directImagesOf: () => [], pathCandidates: () => [], isNoise: () => false });
-  vm.runInContext(extract(serverSource, 'async function parseFile(absPath) {', '\nasync function transcriptImage('), box);
-  return JSON.parse(JSON.stringify((await box.parseFile(file)).meta.ctx));
+  vm.runInContext(extract(serverSource, 'async function parseFile(', '\nasync function transcriptImage('), box);
+  const parsed = JSON.parse(JSON.stringify(await box.parseFile(file)));
+  const captured = JSON.parse(JSON.stringify(await box.parseFile(file + '.not-on-disk', fs.readFileSync(file, 'utf8'))));
+  assert.deepEqual(captured, parsed, 'captured text preserves the entire branch/context record');
+  return parsed.meta.ctx;
 }
 const usage = (input, output = 0, cacheRead = 0) => ({ input, output, cacheRead, cacheWrite: 0 });
 const reply = (id, parentId, model, u) => ({ type: 'message', id, parentId, message: { role: 'assistant', provider: 'p', model, content: 'ok', usage: u } });
@@ -96,6 +103,28 @@ test('a Claude transcript counts cache writes and reads too', async t => {
 
 test('no reply yet: nothing to draw', async t => {
   assert.equal(await parse(t, [{ type: 'session', id: 's', cwd: '/tmp' }, ask('q1', null)]), null);
+});
+
+test('captured UTF-8/CRLF text, including an unterminated final line, is independent of later disk bytes', async t => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'captured-context-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'session.jsonl');
+  const captured = [
+    JSON.stringify({ type: 'session', id: 'captured', cwd: dir }),
+    JSON.stringify({ ...ask('q1', null), message: { role: 'user', content: 'Grüße — 東京 😺\nsecond line' } }),
+    '{malformed record', // Same tolerant JSONL behavior on either input path.
+    JSON.stringify(reply('a1', 'q1', 'm1', usage(7, 3, 11))),
+  ].join('\r\n');
+  fs.writeFileSync(file, captured);
+  const box = vm.createContext({ fs, readline, require: streamRequire, usageLib, settingsLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
+    toolEventsOf: () => [], directImagesOf: () => [], pathCandidates: () => [], isNoise: () => false });
+  vm.runInContext(extract(serverSource, 'async function parseFile(', '\nasync function transcriptImage('), box);
+  const disk = JSON.parse(JSON.stringify(await box.parseFile(file)));
+  assert.equal(disk.messages[0].text, 'Grüße — 東京 😺\nsecond line');
+  assert.deepEqual(disk.meta.ctx, { used: 21, provider: 'p', model: 'm1' });
+  fs.writeFileSync(file, JSON.stringify({ type: 'session', id: 'later-disk', cwd: dir }));
+  assert.equal((await box.parseFile(file)).meta.sessionId, 'later-disk');
+  assert.deepEqual(JSON.parse(JSON.stringify(await box.parseFile(file, captured))), disk);
 });
 
 function fillHarness(catalog) {

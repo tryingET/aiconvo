@@ -31,10 +31,12 @@ test('transcript attaches speed to the saved reply, hides metadata, and preserve
     { type: 'custom', id: 'future', parentId: 'speed', customType: 'chattering-speed', data: { v: 100, samples: [{ ...sample, text: part(100, 90, 4, 3) }] } },
   ];
   fs.writeFileSync(file, lines.map(JSON.stringify).join('\n'));
-  const box = vm.createContext({ fs, readline, usageLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
+  const box = vm.createContext({ fs, readline, require: specifier => { assert.equal(specifier, 'node:stream'); return require(specifier); }, usageLib, textOf, conversationFlow: require('../conversation-flow'), createClaudeChain: require('../claude-chain').createClaudeChain,
     toolEventsOf: () => [], directImagesOf: () => [], pathCandidates: () => [], isNoise: () => false });
-  vm.runInContext(extract('async function parseFile(absPath) {', '\nasync function transcriptImage('), box);
+  vm.runInContext(extract('async function parseFile(', '\nasync function transcriptImage('), box);
   const parsed = await box.parseFile(file);
+  const captured = await box.parseFile(file + '.not-on-disk', fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(JSON.parse(JSON.stringify(captured)), JSON.parse(JSON.stringify(parsed)), 'captured text preserves saved speed, metadata visibility and ancestry');
   assert.equal(parsed.messages.length, 2);
   assert.equal(parsed.messages[0].speed, undefined);
   assert.equal(parsed.messages[1].speed.ms, 4000, 'future schema ignored');

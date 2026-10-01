@@ -16320,12 +16320,24 @@ function backgroundAiSectionHtml() {
     <div class="set-help">Model calls Chattering makes without being asked each time. They send conversation text to the model above.</div>
     <label class="set-check"><input id="setBgNames" type="checkbox"${b.names ? ' checked' : ''}${can ? '' : ' disabled'}> short names for conversations, projects and saved documents</label>
     <label class="set-check"><input id="setBgMemory" type="checkbox"${b.memory ? ' checked' : ''}${can ? '' : ' disabled'}> keep project memory current: re-read a conversation after it changes</label>
+    <label>automatic memory scope <select id="setAutomaticMemory"${can ? '' : ' disabled'}>${[['legacy', 'legacy (existing behavior)'], ['off', 'off'], ['changes-after-enable', 'only changes after enabling']].map(([v, text]) => `<option value="${v}"${settingsOf().automaticMemory === v ? ' selected' : ''}>${text}</option>`).join('')}</select></label>
+    <div class="set-help">Future-only enabling records existing raw revisions without calling the model. Changed sessions may include their old context. Startup discovery and imported files are baselined, not backfilled. Failed or interrupted calls never retry automatically; disable/re-enable records a fresh baseline.</div>
+    ${settingsState?.automaticMemory?.error ? `<div class="set-help">${esc(settingsState.automaticMemory.error)}</div>` : ''}
+    ${(settingsState?.automaticMemory?.pending || []).map(p => `<div class="set-help">${esc(p.key)}: ${esc(p.status)}${p.error ? ' — ' + esc(p.error) : ''}${can ? ` <button class="setMemoryDiscard" data-key="${esc(p.key)}">discard without inference</button>` : ''}</div>`).join('')}
     <div class="set-help">${esc(when)} Buttons you press (build memory, update notes, a new title) always work. Settings → usage shows what these calls used.${can ? '' : ' Only the owner or an admin can change this.'}</div>`;
 }
 
 function bindPaneModel(root) {
   if ($('setBgNames')) $('setBgNames').onchange = () => saveBackgroundAi({ names: $('setBgNames').checked });
   if ($('setBgMemory')) $('setBgMemory').onchange = () => saveBackgroundAi({ memory: $('setBgMemory').checked });
+  if ($('setAutomaticMemory')) $('setAutomaticMemory').onchange = async () => {
+    await saveBackgroundAi({ automaticMemory: $('setAutomaticMemory').value });
+    renderSettings();
+  };
+  root.querySelectorAll('.setMemoryDiscard').forEach(button => button.onclick = async () => {
+    try { settingsState = await postJson('/api/settings/memory-discard', { id: button.dataset.key }); renderSettings(); }
+    catch (e) { toast(e.message); }
+  });
   $('setSimplifyPromptSave').onclick = () => saveSettings({ simplifyPrompt: $('setSimplifyPrompt').value }, 'rewrite prompt saved');
   $('setSimplifyPromptReset').onclick = () => saveSettings({ simplifyPrompt: '' }, 'default rewrite prompt restored');
   $('setResumePromptSave').onclick = () => saveSettings({ resumePrompt: $('setResumePrompt').value }, 'resume message saved');
