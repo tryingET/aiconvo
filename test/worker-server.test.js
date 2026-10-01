@@ -49,7 +49,7 @@ async function start(s, token) {
   const out = await s.request('/api/distill/start?id=' + encodeURIComponent(key) + '&force=1', {}, 'POST', token || s.token);
   assert.equal(out.status, 202, JSON.stringify(out)+s.log()); return out.data.id;
 }
-const finished = (s, id) => until(async () => (await s.request('/api/jobs')).data.find(j => j.id === id && j.status !== 'running'));
+const finished = (s, id, timeout = 12000) => until(async () => (await s.request('/api/jobs')).data.find(j => j.id === id && j.status !== 'running'), 'owned job finished', timeout);
 
 async function follow(t, s, token) {
   const abort = new AbortController(), events = []; let buffer = '';
@@ -97,9 +97,12 @@ test('real server opted note+leaf: exact source images, current title, private r
   assert.doesNotMatch(JSON.stringify(events),/PRIVATE_SOURCE_NOTE/); await close();
 });
 
-for (const change of ['source', 'permission', 'model', 'opt-in']) test('real server rejects held cold result after '+change+' change, without correction/publication', { timeout: 30000 }, async t => {
+// Windows composes cold SDK startup, control requests and up to 30s of
+// fresh WMI-backed cleanup. Give those phases separate bounded budgets;
+// retain every refusal, request-count and no-publication assertion.
+for (const change of ['source', 'permission', 'model', 'opt-in']) test('real server rejects held cold result after '+change+' change, without correction/publication', { timeout: process.platform === 'win32' ? 90000 : 30000 }, async t => {
   const s = await setup(t, true), id = await start(s, 'actor-token');
-  await until(() => s.requests.length === 1);
+  await until(() => s.requests.length === 1, 'first held cold provider request', process.platform === 'win32' ? 30000 : 12000);
   if (change === 'source') fs.appendFileSync(s.source, '\n');
   else if (change === 'permission') assert.equal((await s.request('/api/access', { id: key, mode: 'listed', owners: ['owner'], listed: {} }, 'PUT')).status, 200);
   else {
@@ -107,7 +110,7 @@ for (const change of ['source', 'permission', 'model', 'opt-in']) test('real ser
     const changed = await s.request('/api/settings', { ...settings, ...(change === 'model' ? { thinking: 'low' } : { memoryImages: false }) }, 'PUT');
     assert.equal(changed.status, 200, JSON.stringify(changed));
   }
-  s.release(); const job = await finished(s, id); assert.equal(job.status, 'error', JSON.stringify(job)+s.log());
+  s.release(); const job = await finished(s, id, process.platform === 'win32' ? 30000 : 12000); assert.equal(job.status, 'error', JSON.stringify(job)+s.log());
   assert.equal(s.requests.length, 1); assert.equal(fs.existsSync(sessionCachePath(path.join(s.cache,'memory-leaves'),key)), false);
   assert.equal(fs.readdirSync(s.notes).some(f => /^memory-.*\.md$/.test(f)), false);
 });

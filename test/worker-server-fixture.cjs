@@ -11,8 +11,8 @@ function sanitizeFixtureLog(value, secrets = []) {
     .replace(/(["']?(?:apiKey|token|password|secret|authorization)["']?\s*[:=]\s*)(["'][^"']*["']|[^\s,;}]+)/gi, '$1[redacted]')
     .replace(/\b[\w-]*synthetic[\w-]*\b|\b[\w-]+-token\b/gi, '[redacted]');
 }
-async function until(fn, label = 'fixture condition') {
-  for (let n = 0; n < 300; n++) { const value = await fn(); if (value) return value; await sleep(40); }
+async function until(fn, label = 'fixture condition', timeout = 12000) {
+  for (let n = 0; n < Math.ceil(timeout / 40); n++) { const value = await fn(); if (value) return value; await sleep(40); }
   throw new Error('Timed out: ' + label);
 }
 async function port() { const s = net.createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const p = s.address().port; await new Promise(r => s.close(r)); return p; }

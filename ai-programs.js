@@ -340,14 +340,25 @@ function createAiPrograms({ piExec, modelExec = null, chatPost, voiceEndpoint, l
   // Pi call instead.
   const rawText = new AsyncLocalStorage();
   const memoryCalls = new AsyncLocalStorage();
+  // FunctAI can close its facade before an aborted transport has finished.
+  // A cold memory scope owns those promises until cleanup is settled.
+  const memoryTransports = new WeakMap();
   async function load() {
     if (built) return built;
     const lib = await functai();
     const pi = createPiRouter({ lib, exec: m => {
       const raw = rawText.getStore();
       return piExec(raw ? { ...m, onDelta: piece => { if (m.onDelta) m.onDelta(piece); raw(piece); } } : m);
-    }, modelExec: modelExec || ((request, options) => require('./internal-model').runInternalModel(request, options)),
-      memoryOptions: () => memoryCalls.getStore() || null });
+    }, modelExec: (request, options) => {
+      const active = memoryTransports.get(memoryCalls.getStore());
+      if (active?.closing) throw stopped();
+      const signals = [...new Set([active?.signal, options.signal].filter(Boolean))];
+      const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+      const pending = Promise.resolve().then(() => (modelExec || require('./internal-model').runInternalModel)(request, { ...options, signal }));
+      if (active) active.pending.push(pending);
+      pending.catch(() => {}); // the owning scope below also observes rejection
+      return pending;
+    }, memoryOptions: () => memoryCalls.getStore() || null });
     const voice = createChatRouter({ lib, post: chatPost, endpoint: voiceEndpoint, extra: { chat_template_kwargs: { enable_thinking: false } } });
     const defs = definitions(lib.t);
     const fns = {};
@@ -392,9 +403,20 @@ function createAiPrograms({ piExec, modelExec = null, chatPost, voiceEndpoint, l
     const { memoryConfig } = require('./memory-config');
     const settings = memoryConfig(opts.memory.settings);
     opts.memory.check();
-    return memoryCalls.run({ ...opts.memory, settings, program: name, caller: opts.caller || {} }, () => execute(fn,
-      { voice: false, raw: false, outputs: Object.keys(def.outputs) }, inputs,
-      { ...opts, lm: settings.provider + '/' + settings.model }));
+    const state = { ...opts.memory, settings, program: name, caller: opts.caller || {} };
+    const active = { pending: [], closing: false, signal: opts.signal };
+    memoryTransports.set(state, active);
+    return memoryCalls.run(state, async () => {
+      try {
+        return await execute(fn, { voice: false, raw: false, outputs: Object.keys(def.outputs) }, inputs,
+          { ...opts, lm: settings.provider + '/' + settings.model });
+      } finally {
+        active.closing = true;
+        const settled = await Promise.allSettled(active.pending);
+        const uncertain = settled.find(result => result.status === 'rejected' && result.reason?.retainTemporaryState);
+        if (uncertain) throw uncertain.reason; // never disguise retention as clean cancellation
+      }
+    });
   }
 
   // Programs people make here (design/75): built from FunctAI's definition

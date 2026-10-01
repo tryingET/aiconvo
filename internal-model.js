@@ -83,7 +83,15 @@ async function runInternalModel(request, options = {}) {
     await check();
     return result;
   } catch (e) { retain = !!e.retainTemporaryState; if (retain) e.temporaryDirectory = root; throw e; }
-  finally { if (!retain) await fs.rm(root, { recursive: true, force: true }); }
+  finally {
+    if (!retain) {
+      try { await fs.rm(root, { recursive: true, force: true }); }
+      catch (cause) {
+        throw Object.assign(new Error('Memory temporary cleanup not established; state retained', { cause }),
+          { retainTemporaryState: true, temporaryDirectory: root });
+      }
+    }
+  }
 }
 
 function workerOnce({ request, cwd, env, check, signal, timeoutMs, onDelta, onThinking }) {
