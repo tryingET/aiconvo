@@ -333,7 +333,16 @@ function ownership(pid) {
     const birth = `[System.Diagnostics.Process]::GetProcessById(${Number(pid)}).StartTime.ToUniversalTime().ToString('o')`;
     const script = LOAD_WMI + `$before = ${birth}; $parent = $null; foreach ($p in [System.Management.ManagementObjectSearcher]::new('SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = ${Number(pid)}').Get()) { $parent = $p['ParentProcessId']; break }; $after = ${birth}; if ($before -ne $after -or $null -eq $parent) { throw 'Process ownership changed' }; '{0}\t{1}' -f $before, $parent; ` +
       (!winBoot || winBoot === 'unknown' ? WIN_BOOT_SCRIPT : '');
-    const lines = execFileSync(POWERSHELL, psArgs(script), { encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
+    let lines;
+    try {
+      lines = execFileSync(POWERSHELL, psArgs(script), { encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
+    } catch (error) {
+      // A process can exit during the query. Only a fresh kernel ESRCH proves
+      // absence; live, reused, denied or otherwise uncertain PIDs still fail.
+      try { process.kill(pid, 0); }
+      catch (gone) { if (gone.code === 'ESRCH') return null; }
+      throw error;
+    }
     const [start, parent] = lines[0].split('\t');
     if (!winBoot || winBoot === 'unknown') winBoot = lines[1];
     if (!start || !winBoot || winBoot === 'unknown' || !/^\d+$/.test(parent || '')) throw new Error('Current process ownership unavailable');
