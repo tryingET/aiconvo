@@ -1191,6 +1191,7 @@ async function transcriptImage(key, entry, blockPath) {
 const policy = require('./policy.js');
 const sseByConn = new Map(); // conn id → bound sign-in proof, rechecked for every push
 function eventMemoryIdentity(client) {
+  if (client.res.writableEnded || client.res.destroyed) return null;
   const identity = client.proof ? wallsFor(LAN_TOKEN ? usersLib.identify({ roster, installToken: LAN_TOKEN, ...client.proof }) : ownerIdentity()) : liveMemoryIdentity(client.identity);
   if (!identity) { client.res.end(); return null; }
   return identity;
@@ -1199,7 +1200,11 @@ function broadcast(ev) {
   const line = 'data: ' + JSON.stringify(ev) + '\n\n';
   for (const client of sseByConn.values()) {
     let view;
-    try { view = policy.eventView(ev, receiverFor(eventMemoryIdentity(client))); }
+    try {
+      const identity = eventMemoryIdentity(client);
+      if (!identity) continue;
+      view = policy.eventView(ev, receiverFor(identity));
+    }
     catch (e) { console.error('[events] ' + (ev && ev.type) + ': ' + e.message); view = null; }
     if (!view) continue;
     try { client.res.write(view === ev ? line : 'data: ' + JSON.stringify(view) + '\n\n'); } catch {}
@@ -6362,7 +6367,11 @@ function programLiveSend(ev, conns = [...programLiveFollowers]) {
     const client = sseByConn.get(conn);
     if (!client) { programLiveFollowers.delete(conn); continue; }
     let view;
-    try { view = policy.eventView(ev, receiverFor(eventMemoryIdentity(client))); }
+    try {
+      const identity = eventMemoryIdentity(client);
+      if (!identity) { programLiveFollowers.delete(conn); continue; }
+      view = policy.eventView(ev, receiverFor(identity));
+    }
     catch (e) { console.error('[programs-live] ' + e.message); view = null; }
     if (!view) continue;
     const line = view === ev ? (whole ||= 'data: ' + JSON.stringify(ev) + '\n\n') : 'data: ' + JSON.stringify(view) + '\n\n';

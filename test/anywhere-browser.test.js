@@ -41,7 +41,10 @@ test('a phone pairs in the browser and runs Chattering from the computer', { ski
   t.after(() => require('./helpers/cleanup.js').stopAndRemove(child, home));
   const base = 'http://127.0.0.1:' + port;
   for (let i = 0; ; i++) { try { if ((await fetch(base + '/health')).ok) break; } catch {} if (i > 200) assert.fail('server did not start\n' + log); await sleep(100); }
-  const post = async (p, body) => (await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })).json();
+  const post = async (p, body) => {
+    try { return await (await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })).json(); }
+    catch (error) { assert.fail(`POST ${p} failed: ${error.cause?.code || error.message}\nchild exit=${child.exitCode} signal=${child.signalCode}\n${log}`); }
+  };
   await post('/api/anywhere/settings', { relay: relayUrl });
   const code = await post('/api/anywhere/pair');
   assert.ok(code.url, JSON.stringify(code));
