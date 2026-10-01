@@ -40,7 +40,13 @@ async function start(s) {
 }
 const done=(s,id)=>until(async()=>(await s.request('/api/jobs')).data.find(j=>j.id===id&&j.finishedAt));
 
-test('shipping search: cold note after restart and old/ambiguous derived markdown require live source admission in lexical and semantic hits',{timeout:30000},async t=>{
+// Windows composition: server scan 12s + cold-call deadline 120s + owned
+// OS cleanup 30s + claim persistence 12s + restart close/scan 6s/12s +
+// markdown readiness 12s + API assertions 30s + final close 6s = 240s.
+// Native transport alone took 3–27s; 30s for this entire chain is not a bound.
+// Other shipping tests and the already-passing POSIX search budget stay put.
+const searchTimeout = process.platform === 'win32' ? 12000 + 120000 + 30000 + 12000 + 6000 + 12000 + 12000 + 30000 + 6000 : 30000;
+test('shipping search: cold note after restart and old/ambiguous derived markdown require live source admission in lexical and semantic hits',{timeout:searchTimeout},async t=>{
   const s=await serverFixture(t);assert.equal((await done(s,await start(s))).status,'done');
   const note=(await s.request('/api/note?id='+encodeURIComponent(key))).data.notePath;
   fs.writeFileSync(path.join(s.notes,'old-derived.md'),'# '+CANARY+' old derived\n\n'+CANARY);
@@ -53,7 +59,10 @@ test('shipping search: cold note after restart and old/ambiguous derived markdow
   const query='/api/search?q='+CANARY;
   // The lexical scanner indexes regular markdown, not symlinks; the alias is
   // exercised below as a semantic hit against the same live source admission.
-  const indexedFiles = [path.basename(note), 'old-derived.md', 'projects/historical/overview.md'];
+  // walk() -> putMarkdown() -> search() preserves native path.relative(),
+  // unlike web/GPU fixture metadata, which also exercises forward slashes.
+  const historicalFile = path.join('projects', 'historical', 'overview.md');
+  const indexedFiles = [path.basename(note), 'old-derived.md', historicalFile];
   await until(async()=> {
     const groups = (await s.request(query)).data.groups;
     return indexedFiles.every(file => groups.some(g => g.file === file));
@@ -63,9 +72,9 @@ test('shipping search: cold note after restart and old/ambiguous derived markdow
   assert.doesNotMatch(JSON.stringify(lexical.data.groups),new RegExp(CANARY));
   assert.deepEqual(lexical.data.groups,[]);assert.equal(lexical.data.total,0);
   const allowed=await s.request(query,undefined,'GET','reader-token');
-  assert.ok(allowed.data.groups.some(g=>g.file===path.basename(note)));assert.ok(allowed.data.groups.some(g=>g.file==='projects/historical/overview.md'));
+  assert.ok(allowed.data.groups.some(g=>g.file===path.basename(note)));assert.ok(allowed.data.groups.some(g=>g.file===historicalFile));
   assert.equal(allowed.data.groups.some(g=>g.file==='old-derived.md'),false,'ambiguous old source is not public');
-  for(const file of [path.basename(note),'old-derived.md','projects/historical/overview.md','alias.md','../outside.md'])
+  for(const file of new Set([path.basename(note),'old-derived.md',historicalFile,'projects/historical/overview.md','alias.md','../outside.md']))
     s.semanticHits.push({score:1,meta:{kind:'note',file,title:CANARY,snip:CANARY}});
   // A permitted first hit must not lend its admission to a later denied file
   // with the same group key: authorize raw hits before merging snippets.
@@ -76,6 +85,7 @@ test('shipping search: cold note after restart and old/ambiguous derived markdow
   assert.deepEqual((await s.request(semantic,undefined,'GET','outsider-token')).data.groups,[]);
   const visible=(await s.request(semantic,undefined,'GET','reader-token')).data.groups;
   assert.ok(visible.some(g=>g.file===path.basename(note)));assert.equal(visible.some(g=>g.file==='old-derived.md'),false);
+  for(const file of new Set([historicalFile,'projects/historical/overview.md'])) assert.ok(visible.some(g=>g.file===file),'admitted semantic historical source: '+file);
   assert.doesNotMatch(JSON.stringify(visible),new RegExp(deniedSemantic),'a permitted group cannot launder a denied semantic hit');
   await s.request('/api/access',{id:key,mode:'listed',owners:['owner'],listed:{}},'PUT');
   assert.deepEqual((await s.request(query,undefined,'GET','reader-token')).data.groups,[]);
@@ -121,8 +131,13 @@ test('shipping cleanup: captured detached provider descendants exit on completio
     assert.deepEqual(processes.identity(outside.pid),outsideId,'no unrelated process killed');
   }
   assert.ok(findings.every(f=>f.alive===null),JSON.stringify(findings));assert.ok(findings.every(f=>!f.tempExists));
-  // Deliberately make one captured identity unreadable after capture. The real
-  // transport must reject and retain credentials, rather than guess it exited.
+  // This injection depends on Linux identity-read ordering and a /proc cwd
+  // absence proof before deleting retained credentials. Windows cannot provide
+  // that proof via cwd(); do not interpret its null as absence. Native detached
+  // completion/cancel and all assertions above still run on every platform.
+  await t.test('unreadable captured identity rejects and retains state with Linux proc exit proof', {
+    skip: process.platform !== 'linux' ? 'Fault-read ordering and inactive-cwd proof require Linux /proc; native completion/cancel remain enabled' : false,
+  }, async t => {
   const s=setup(t,{MEMORY_FIXTURE_CHILD:'1',MEMORY_FIXTURE_DETACHED:'1',MEMORY_FIXTURE_WAIT:'200'});
   const pending=require('../internal-model').runInternalModel({messages:[{role:'user',content:'synthetic',timestamp:0}]},{...s.transport(),settings:s.settings,check(){}});
   pending.catch(()=>{});await s.waitForCapture();const capture=s.captures()[0],id=processes.identity(capture.childPid),original=processes.identity;
@@ -132,9 +147,9 @@ test('shipping cleanup: captured detached provider descendants exit on completio
   finally {
     processes.identity=original;const current=original(id.pid);if(current&&current.start===id.start&&current.boot===id.boot)process.kill(id.pid,'SIGKILL');
     await until(()=>{const current=original(id.pid);return !current||current.start!==id.start||current.boot!==id.boot;},'owned captured fixture identity exits');
-    // Windows has no cross-process cwd API; identity exit above remains required.
-    if(process.platform !== 'win32') await until(()=>!processes.list().some(p=>processes.cwd(p.pid)===capture.cwd),'owned retained fixture processes exit');
+    await until(()=>!processes.list().some(p=>processes.cwd(p.pid)===capture.cwd),'owned retained fixture processes exit');
     if(retained)fs.rmSync(retained,{recursive:true,force:true});
   }
+  });
   assert.deepEqual(processes.identity(outside.pid),outsideId);
 });
