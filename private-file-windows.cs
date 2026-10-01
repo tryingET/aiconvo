@@ -154,19 +154,44 @@ public static class ChatteringPrivateFile {
             if (!SetFileInformationByHandle(stream.SafeFileHandle, 4, buffer, 4)) throw new Win32Exception(Marshal.GetLastWin32Error());
         } finally { Marshal.FreeHGlobal(buffer); }
     }
+    static void RememberCleanupFailure(Exception primary, Exception cleanup, string temporary) {
+        primary.Data["RetainTemporaryState"] = true;
+        primary.Data["TemporaryFile"] = temporary;
+        string previous = primary.Data["CleanupFailure"] as string;
+        primary.Data["CleanupFailure"] = (previous == null ? "" : previous + "\n") + cleanup.ToString();
+    }
     public static void Write(string destination, byte[] bytes) {
+        WriteWithCleanup(destination, bytes, Erase);
+    }
+    // The production writer uses Erase; a private injectable cleanup boundary
+    // lets native tests exercise a failed erasure after a REAL failed rename.
+    static void WriteWithCleanup(string destination, byte[] bytes, Action<FileStream> erase) {
         string tmp = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        using (var stream = Open(tmp, true)) {
-            bool published = false;
+        var stream = Open(tmp, true);
+        bool published = false;
+        Exception primary = null;
+        try {
+            Check(stream); // descriptor of the acquired object, before bytes
+            stream.Write(bytes, 0, bytes.Length);
+            stream.Flush(true);
+            Check(stream);
+            Rename(stream, destination); // publish the acquired object itself
+            published = true;
+        } catch (Exception error) {
+            primary = error;
+            throw; // preserve the original exception and stack
+        } finally {
             try {
-                Check(stream); // descriptor of the acquired object, before bytes
-                stream.Write(bytes, 0, bytes.Length);
-                stream.Flush(true);
-                Check(stream);
-                Rename(stream, destination); // publish the acquired object itself
-                published = true;
+                if (!published) erase(stream); // also handle-bound
+            } catch (Exception cleanup) {
+                if (primary == null) { primary = cleanup; throw; }
+                RememberCleanupFailure(primary, cleanup, tmp);
             } finally {
-                if (!published) Erase(stream); // also handle-bound
+                try { stream.Dispose(); }
+                catch (Exception cleanup) {
+                    if (primary == null) throw;
+                    RememberCleanupFailure(primary, cleanup, published ? destination : tmp);
+                }
             }
         }
     }

@@ -19,11 +19,25 @@ function windowsOperation(file, operation, bytes) {
   };
   // Pipe code, filename and bytes, not an oversized -EncodedCommand or secret argv.
   const script = "$ErrorActionPreference = 'Stop'; $request = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8).ReadToEnd() | ConvertFrom-Json; " +
-    "Add-Type -TypeDefinition ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($request.source))); $file = $request.file; " + actions[operation];
+    "Add-Type -TypeDefinition ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($request.source))); $file = $request.file; try { " + actions[operation] + " } catch { " +
+    "$e = $_.Exception; while (($e -is [System.Management.Automation.MethodInvocationException] -or $e -is [System.Reflection.TargetInvocationException]) -and $null -ne $e.InnerException) { $e = $e.InnerException }; " +
+    "$code = $null; if ($e -is [System.ComponentModel.Win32Exception]) { $code = $e.NativeErrorCode }; " +
+    "$detail = @{ message = $e.Message; nativeErrorCode = $code; retainTemporaryState = [bool]$e.Data['RetainTemporaryState']; temporaryFile = $e.Data['TemporaryFile']; cleanupFailure = $e.Data['CleanupFailure'] } | ConvertTo-Json -Compress; " +
+    "[Console]::Write('ERROR:' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($detail))) }";
   const input = JSON.stringify({ source: source.toString('base64'), file: path.resolve(file), bytes: bytes?.toString('base64') });
   const result = execFileSync(path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
     ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
     { timeout: 15000, windowsHide: true, input, encoding: 'utf8', maxBuffer: 2 * BUDGET, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  if (result.startsWith('ERROR:')) {
+    const failure = JSON.parse(Buffer.from(result.slice(6), 'base64').toString('utf8'));
+    const error = new Error(failure.message);
+    error.nativeErrorCode = failure.nativeErrorCode;
+    if (failure.retainTemporaryState === true) {
+      error.retainTemporaryState = true; error.temporaryFile = failure.temporaryFile;
+      error.cleanupFailure = failure.cleanupFailure;
+    }
+    throw error;
+  }
   if (operation === 'read' && result.startsWith('DATA:')) return Buffer.from(result.slice(5), 'base64').toString('utf8');
   if (result === 'ABSENT' && operation === 'read') return null;
   if (result === 'ABSENT') throw Object.assign(new Error('Key storage absent'), { code: 'ENOENT' });
@@ -64,13 +78,55 @@ function ensurePrivateFileSync(file) {
   if (process.platform === 'win32') return windowsOperation(file, 'ensure');
   withHandle(file, true, false, () => {});
 }
+// Publication uses path rename, so checks AFTER rename are only diagnostics.
+// Prove an owner-controlled, symlink-free directory chain BEFORE staging.
+// Trust / as the namespace anchor, root/current-user ancestors, and sticky
+// shared ancestors only when the next entry is root/current-user owned.
+// Concurrent same-uid/privileged permission or path changes, and namespace/
+// mount changes are outside this contract. Existing writable directories are refused, never chmodded.
+function publicationDirectory(directory) {
+  if (typeof process.getuid !== 'function') throw new Error('Publication directory owner unavailable');
+  const uid = process.getuid(), root = path.parse(directory).root;
+  const entries = [root];
+  for (const part of path.relative(root, directory).split(path.sep).filter(Boolean))
+    entries.push(path.join(entries.at(-1), part));
+  const handles = [];
+  const close = () => { for (const fd of handles.reverse()) fs.closeSync(fd); };
+  try {
+    for (let i = 0; i < entries.length; i++) {
+      const dir = entries[i], final = i === entries.length - 1;
+      let fd;
+      try { fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); }
+      catch (e) {
+        if (e.code !== 'ENOENT' || i === 0) throw new Error('Unsafe publication directory or alias: ' + dir, { cause: e });
+        // The preceding acquired directory already passed the ownership and
+        // write checks. Only NEW directories get mode 0700, atomically.
+        try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (create) { if (create.code !== 'EEXIST') throw create; }
+        fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      }
+      handles.push(fd);
+      const st = fs.fstatSync(fd);
+      if (!st.isDirectory() || (i > 0 && st.uid !== uid && st.uid !== 0) || (final && st.uid !== uid))
+        throw new Error('Unsafe publication directory owner: ' + dir);
+      if ((st.mode & 0o022) && (final || !(st.mode & 0o1000)))
+        throw new Error('Unsafe writable publication directory: ' + dir);
+    }
+    return close;
+  } catch (e) { close(); throw e; }
+}
 function writePrivateFileSync(file, bytes) {
   bytes = Buffer.from(bytes);
   if (bytes.length > BUDGET) throw new Error('Key storage exceeds budget');
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  if (process.platform === 'win32') return windowsOperation(file, 'write', bytes);
+  if (process.platform === 'win32') {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    return windowsOperation(file, 'write', bytes);
+  }
+  file = path.resolve(file);
+  const closeDirectories = publicationDirectory(path.dirname(file));
   const tmp = file + '.' + randomUUID() + '.tmp';
-  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  let fd;
+  try { fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); }
+  catch (e) { closeDirectories(); throw e; }
   const matches = st => { const own = fs.fstatSync(fd); return own.dev === st.dev && own.ino === st.ino; };
   try {
     secureHandle(fd, true);
@@ -81,8 +137,8 @@ function writePrivateFileSync(file, bytes) {
     if (!matches(fs.lstatSync(file))) throw new Error('Published key pathname was replaced');
     secureHandle(fd, false);
   } finally {
-    fs.closeSync(fd);
-    fs.rmSync(tmp, { force: true });
+    try { fs.closeSync(fd); fs.rmSync(tmp, { force: true }); }
+    finally { closeDirectories(); }
   }
 }
 module.exports = { assertPrivateFileSync, ensurePrivateFileSync, readPrivateFileSync, writePrivateFileSync };

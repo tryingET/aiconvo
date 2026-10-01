@@ -75,3 +75,58 @@ test('Given an existing empty key file, When the native reader opens it, Then em
   writePrivateFileSync(file, '');
   assert.equal(readPrivateFileSync(file), '');
 });
+
+
+// These are actual NTFS tests, not emulated POSIX lock behavior. They are
+// declared on Windows; Linux runs do not establish either native result.
+if (process.platform === 'win32') {
+  function native(file, body) {
+    const code = fs.readFileSync(path.join(__dirname, '../private-file-windows.cs'), 'utf8');
+    const script = "$ErrorActionPreference = 'Stop'; Add-Type -TypeDefinition ([System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8).ReadToEnd()); " +
+      `$file = '${file.replace(/'/g, "''")}'; ` + body;
+    return execFileSync(path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { input: code, encoding: 'utf8', timeout: 30000, windowsHide: true }).trim();
+  }
+  const seedAndLock = String.raw`
+    [ChatteringPrivateFile]::Write($file, [System.Text.Encoding]::UTF8.GetBytes('existing identity'));
+    $locked = [ChatteringPrivateFile]::Open($file, $false);
+    try {`;
+  const unchangedTarget = String.raw`
+    $locked.Position = 0; $saved = [System.IO.MemoryStream]::new(); $locked.CopyTo($saved);
+    if ([System.Text.Encoding]::UTF8.GetString($saved.ToArray()) -ne 'existing identity') { throw 'Existing credential overwritten' };`;
+  test('Given a native Windows locked destination, When publication fails, Then original credential survives and no staging residue remains', t => {
+    const file = fixture(t);
+    assert.equal(native(file, seedAndLock + String.raw`
+      $primary = $null;
+      try { [ChatteringPrivateFile]::Write($file, [System.Text.Encoding]::UTF8.GetBytes('replacement identity')) }
+      catch { $primary = $_.Exception; while ($null -ne $primary.InnerException) { $primary = $primary.InnerException } }
+      if (!($primary -is [System.ComponentModel.Win32Exception]) -or $primary.NativeErrorCode -ne 32) { throw 'Original sharing failure not preserved' };
+      if ($primary.Data['RetainTemporaryState']) { throw 'Erasure unexpectedly failed' };
+      if ([System.IO.Directory]::GetFiles([System.IO.Path]::GetDirectoryName($file), 'key.*.tmp').Length -ne 0) { throw 'Staging residue remains' };
+      ` + unchangedTarget + String.raw`
+    } finally { $locked.Dispose() }
+    [Console]::Write('LOCKED-PUBLICATION-OK');`), 'LOCKED-PUBLICATION-OK');
+    assert.equal(readPrivateFileSync(file), 'existing identity');
+  });
+  test('Given a real native publication failure and injected erasure failure, When the production writer unwinds, Then primary failure is preserved and protected retained state is reported', t => {
+    const file = fixture(t);
+    assert.equal(native(file, seedAndLock + String.raw`
+      $erase = [System.Action[System.IO.FileStream]]{ param($stream) throw [System.IO.IOException]::new('injected erasure failure') };
+      $method = [ChatteringPrivateFile].GetMethod('WriteWithCleanup', [System.Reflection.BindingFlags]'NonPublic,Static');
+      $arguments = [object[]]::new(3); $arguments[0] = $file; $arguments[1] = [System.Text.Encoding]::UTF8.GetBytes('replacement identity'); $arguments[2] = $erase;
+      $primary = $null;
+      try { $method.Invoke($null, $arguments) }
+      catch { $primary = $_.Exception; while ($null -ne $primary.InnerException) { $primary = $primary.InnerException } }
+      if (!($primary -is [System.ComponentModel.Win32Exception]) -or $primary.NativeErrorCode -ne 32) { throw 'Erasure masked primary failure' };
+      if (!$primary.Data['RetainTemporaryState'] -or !$primary.Data['CleanupFailure'].Contains('injected erasure failure')) { throw 'Retained-state diagnosis missing' };
+      $temporary = $primary.Data['TemporaryFile'];
+      $left = @([System.IO.Directory]::GetFiles([System.IO.Path]::GetDirectoryName($file), 'key.*.tmp'));
+      if ($left.Length -ne 1 -or $left[0] -ne $temporary) { throw 'Retained-state path is wrong' };
+      if (![ChatteringPrivateFile]::Inspect($temporary, $false)) { throw 'Retained file is not protected' };
+      ` + unchangedTarget + String.raw`
+    } finally { $locked.Dispose() }
+    [Console]::Write('RETAINED-PRIMARY-OK');`), 'RETAINED-PRIMARY-OK');
+    assert.equal(readPrivateFileSync(file), 'existing identity');
+  });
+}
