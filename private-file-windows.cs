@@ -53,6 +53,9 @@ public static class ChatteringPrivateFile {
     // replacement/deletion. OPEN_REPARSE_POINT makes a leaf alias inspectable
     // rather than following it. Parent aliases still resolve to a checked object.
     public static FileStream Open(string file, bool create) {
+        return Acquire(file, create, false);
+    }
+    static FileStream Acquire(string file, bool create, bool missing) {
         IntPtr descriptor = IntPtr.Zero, attributes = IntPtr.Zero;
         SafeFileHandle handle = null;
         try {
@@ -65,7 +68,12 @@ public static class ChatteringPrivateFile {
                 Marshal.StructureToPtr(sa, attributes, false);
             }
             handle = CreateFileW(Path.GetFullPath(file), FullControl, 0, attributes, create ? 1u : 3u, OpenReparsePoint, IntPtr.Zero);
-            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (handle.IsInvalid) {
+                int error = Marshal.GetLastWin32Error();
+                // Absence is recognized here, at initial acquisition ONLY.
+                if (!create && missing && (error == 2 || error == 3)) return null;
+                throw new Win32Exception(error);
+            }
             ValidateObject(handle);
             var stream = new FileStream(handle, FileAccess.ReadWrite, 4096, false);
             handle = null; // ownership transferred to FileStream
@@ -102,11 +110,7 @@ public static class ChatteringPrivateFile {
         Check(stream);
     }
     static FileStream ExistingOrAbsent(string file) {
-        try { return Open(file, false); }
-        catch (Win32Exception e) {
-            if (e.NativeErrorCode == 2 || e.NativeErrorCode == 3) return null;
-            throw;
-        }
+        return Acquire(file, false, true);
     }
     public static bool Inspect(string file, bool protect) {
         using (var stream = ExistingOrAbsent(file)) {

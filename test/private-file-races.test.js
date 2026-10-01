@@ -83,3 +83,15 @@ test('Given the real native helper source, When the Windows adapter launches Pow
   context.module.exports.writePrivateFileSync(path.join(d, 'key'), 'synthetic secret');
   assert.equal(called, true);
 });
+
+
+test('Given ENOENT occurs after credential acquisition rather than at initial open, When the link store loads, Then the error is propagated rather than resetting identity', t => {
+  const d = dir(t), file = path.join(d, 'anywhere-links.json');
+  fs.writeFileSync(file, JSON.stringify({ links: [] }), { mode: 0o600 });
+  const error = Object.assign(new Error('synthetic post-acquisition ENOENT'), { code: 'ENOENT' });
+  const fake = { ...fs, readFileSync(target, ...args) { if (target === file || typeof target === 'number') throw error; return fs.readFileSync(target, ...args); } };
+  const storage = source('private-file', { 'node:fs': fake });
+  if (process.platform === 'win32') storage.readPrivateFileSync = () => { throw error; };
+  const api = source('anywhere-link', { fs: fake, './private-file': storage });
+  assert.throws(() => api.createAnywhereLinks({ dataDir: d }), e => e === error);
+});
