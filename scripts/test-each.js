@@ -34,7 +34,7 @@ function runOne(file) {
       results.push(r);
       const status = timedOut ? `TIMED OUT after ${secs}s` : code === 0 ? `ok (${r.pass} passed${r.skipped ? ', ' + r.skipped + ' skipped' : ''}, ${secs}s)` : `FAILED (${r.fail} failed, ${secs}s)`;
       process.stdout.write(`\n=== ${file}: ${status}\n`);
-      if (code !== 0 || timedOut || r.skipped) process.stdout.write(out.replace(/\s+$/, '') + '\n');
+      if (code !== 0 || timedOut || r.skipped || process.env.CHATTERING_TEST_TRACE === '1') process.stdout.write(out.replace(/\s+$/, '') + '\n');
       resolve();
     });
   });

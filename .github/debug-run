@@ -1,2 +1,2 @@
 ["windows-latest"]
-test/private-file-rename-abi.test.js test/private-file-native.test.js test/private-file.test.js test/private-file-races.test.js
+test/private-file-rename-abi.test.js test/private-file-native.test.js test/private-file.test.js test/private-file-races.test.js test/test-runner-trace.test.js
