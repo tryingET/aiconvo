@@ -1,2 +1,2 @@
 ["ubuntu-latest","macos-latest","windows-latest"]
-test/owned-process-group.test.js test/owned-process-group-faults.test.js test/process-cleanup-join.test.js test/localmachines-browser-cleanup.test.js test/localmachines-shared-cleanup.test.js test/localmachines-cleanup.test.js test/localmachines-server.test.js test/programs-watch.test.js test/programs-watch-native.test.js test/programs-app.test.js test/programs-live-app.test.js test/programs-make-app.test.js
+test/viewer-browser-lifecycle.test.js test/file-view.test.js test/mac-keys.test.js test/programs-app.test.js test/programs-live-app.test.js test/programs-make-app.test.js test/localmachines-cleanup.test.js test/localmachines-server.test.js

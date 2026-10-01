@@ -23,20 +23,22 @@ async function viewerBrowser(t, opts = {}) {
   // opts.firstRun keeps the fresh-install state for tests about it.
   if (!opts.firstRun) require('./first-run.js').answerFirstRun(home);
   let server, browser, ws, tearingDown = false;
-  const stop = async child => {
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
-    const exited = new Promise(r => child.once('exit', r)); child.kill('SIGTERM');
-    const timer = setTimeout(() => child.kill('SIGKILL'), 3000);
-    await exited; clearTimeout(timer);
-  };
   // A child of the server (a preview worker, a sandbox) can still be writing
   // when the server exits; a slow temp folder must not fail a passed test.
   t.after(async () => {
     tearingDown = true;
-    ws?.close();
+    const errors = [];
+    try { ws?.close(); } catch (error) { errors.push(error); }
     const { stopAndRemove } = require('./cleanup.js');
-    await stopAndRemove(browser, null); await stopAndRemove(server, null);
-    await stopAndRemove(null, home);
+    const joins = await Promise.allSettled([browser, server].map(child =>
+      Promise.resolve().then(() => stopAndRemove(child, null))));
+    for (const join of joins) if (join.status === 'rejected') errors.push(join.reason);
+    // An unobserved exit is still a possible writer: retain its home.
+    if (joins.every(join => join.status === 'fulfilled')) {
+      try { await stopAndRemove(null, home); } catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length) throw new AggregateError(errors, 'Viewer fixture cleanup failed');
   });
   // Hold both reservations until their distinct port numbers are known.
   // Release before spawn, as for the app port: another process can still
@@ -77,23 +79,46 @@ async function viewerBrowser(t, opts = {}) {
     browser.stderr.on('data', b => { output += b; const m = output.match(/DevTools listening on (ws:\/\/[^\s]+)/); if (m) { clearTimeout(timer); resolve(m[1]); } });
     browser.on('error', e => { clearTimeout(timer); reject(e); });
   });
-  ws = new WebSocket(endpoint); await new Promise(r => ws.onopen = r);
-  let id = 0; const pending = new Map(), exceptions = [], requests = [];
+  ws = new WebSocket(endpoint);
+  let id = 0, transportError, rejectOpening;
+  const pending = new Map(), exceptions = [], requests = [];
+  const failTransport = error => {
+    transportError ||= error;
+    for (const request of pending.values()) request.reject(transportError);
+    pending.clear();
+    rejectOpening?.(transportError);
+  };
+  ws.onerror = event => failTransport(event.error || new Error('CDP WebSocket error', { cause: event }));
+  ws.onclose = event => failTransport(new Error(`CDP WebSocket closed (${event.code}): ${event.reason || 'disconnected'}`));
   ws.onmessage = event => {
     const m = JSON.parse(event.data);
     if (m.method === 'Runtime.exceptionThrown') exceptions.push(m.params.exceptionDetails.exception?.description || m.params.exceptionDetails.text);
     if (m.method === 'Network.requestWillBeSent') requests.push(m.params.request);
-    if (pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
+    if (pending.has(m.id)) { pending.get(m.id).resolve(m); pending.delete(m.id); }
   };
+  await new Promise((resolve, reject) => { ws.onopen = resolve; rejectOpening = reject; });
+  rejectOpening = null;
   // CHATTERING_TEST_TRACE=1 logs every step with its time: where a test
   // waits is then visible on a system one cannot sit at (CI's debug run).
   const trace = process.env.CHATTERING_TEST_TRACE === '1' ? (m => process.stderr.write(`[trace ${((Date.now() - traceStart) / 1000).toFixed(1)}s] ${m}\n`)) : () => {};
   const traceStart = Date.now();
-  const send = (method, params = {}, sessionId) => new Promise(r => {
-    pending.set(++id, m => { if (m.error) trace(method + ' → error ' + JSON.stringify(m.error).slice(0, 200)); r(m); });
-    trace(method + ' ' + (params.expression ? String(params.expression).replace(/\s+/g, ' ').slice(0, 140) : params.url || ''));
-    ws.send(JSON.stringify({ id, method, params, sessionId }));
-  });
+  const send = (method, params = {}, sessionId) => {
+    const response = new Promise((resolve, reject) => {
+      if (!transportError && ws.readyState !== 1) failTransport(new Error('CDP WebSocket is not open'));
+      if (transportError) { reject(transportError); return; }
+      pending.set(++id, { reject, resolve: m => {
+        if (m.error) trace(method + ' → error ' + JSON.stringify(m.error).slice(0, 200));
+        resolve(m); // Preserve protocol error envelopes and evaluate's assertions.
+      } });
+      trace(method + ' ' + (params.expression ? String(params.expression).replace(/\s+/g, ' ').slice(0, 140) : params.url || ''));
+      try { ws.send(JSON.stringify({ id, method, params, sessionId })); }
+      catch (error) { failTransport(error); }
+    });
+    // Some CDP commands are intentionally fire-and-forget (e.g. Browser.close).
+    // Observe rejection without replacing the rejecting promise callers await.
+    response.catch(() => {});
+    return response;
+  };
   const target = await send('Target.createTarget', { url: 'about:blank' });
   const attached = await send('Target.attachToTarget', { targetId: target.result.targetId, flatten: true }), sid = attached.result.sessionId;
   const command = (method, params) => send(method, params, sid);
@@ -108,7 +133,9 @@ async function viewerBrowser(t, opts = {}) {
     // Up to twenty seconds: a loaded machine is slow, and a pass costs no wait.
     for (let i = 0; i < 800; i++) {
       let ok = false;
-      try { ok = await evaluate(`(()=>{try{return !!(${expression})}catch{return false}})()`, contextId); } catch {}
+      try { ok = await evaluate(`(()=>{try{return !!(${expression})}catch{return false}})()`, contextId); } catch (error) {
+        if (transportError) throw transportError;
+      }
       if (ok) return;
       await new Promise(r => setTimeout(r, 25));
     }
