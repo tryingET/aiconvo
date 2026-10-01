@@ -68,8 +68,9 @@ test('browser: making a program, trying and testing it, publishing it, and calli
 
   // Say what it should do, with two examples.
   await evaluate(`Programs.showList()`);
-  await until(`document.querySelector('[data-pg-new]')`, 'a New program button');
-  await click('[data-pg-new]');
+  // Given an asynchronously refreshed list, When New becomes actionable,
+  // Then sample and click the same element in one browser turn.
+  await until(`(()=>{const b=document.querySelector('[data-pg-new]');if(!b||b.disabled)return false;b.click();return true})()`, 'an actionable New program button');
   await until(`document.querySelector('#mkRequest')`);
   await type('#mkRequest', 'Sort a customer message to the team that should answer it.');
   await type('[data-ex="0.input"]', 'I was charged twice');
@@ -200,7 +201,9 @@ test('browser: making a program, trying and testing it, publishing it, and calli
   assert.match(cli('program', 'show', 'team'), /live: v2[\s\S]*answers: result \(one of shipping, billing, product\)[\s\S]*keys: git hook chp_/);
   const defFile = path.join(dir, 'mood.json');
   fs.writeFileSync(defFile, JSON.stringify({ name: 'mood', description: 'How does the customer feel?', inputs: [{ name: 'review', shape: { type: 'string' } }], outputs: [{ name: 'result', shape: { enum: ['happy', 'unhappy'], type: 'string' } }] }));
-  assert.match(cli('program', 'create', defFile, '--project', 'shop'), /^Made mood: .*shop\/programs\/mood/);
+  // Native paths are native on Windows too: require the exact requested
+  // project destination, not a permissive POSIX-only suffix pattern.
+  assert.equal(cli('program', 'create', defFile, '--project', 'shop').split(/\r?\n/)[0], 'Made mood: ' + path.join(shop, 'programs', 'mood'));
   assert.equal(cli('program', 'try', 'mood', '{"review": "It broke on day one"}'), 'unhappy');
   assert.match(cli('program', 'publish', 'mood'), /^Published: v1 answers at \/programs\/mood/);
   assert.equal(cli('program', 'call', 'team', '{"message": "charged"}'), 'billing');

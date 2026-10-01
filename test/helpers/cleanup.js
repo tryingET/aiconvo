@@ -17,8 +17,17 @@ function exited(child, ms) {
     child.once('exit', onExit);
   });
 }
-async function stopAndRemove(child, dir, { graceMs = 3000 } = {}) {
-  if (child && child.exitCode === null && child.signalCode === null) {
+async function stopAndRemove(child, dir, { graceMs = 3000, ownedGroup = null } = {}) {
+  if (ownedGroup) {
+    // Only callers that created and verified a private group may select this
+    // path. Root exit does not join env-only catalog children still writing.
+    const group = require('./owned-process-group');
+    group.validateGroup(child, ownedGroup);
+    const deadline = Date.now() + graceMs;
+    const joined = exited(child, graceMs); joined.catch(() => {});
+    await group.stopOwnedGroup(child, ownedGroup, deadline);
+    await joined;
+  } else if (child && child.exitCode === null && child.signalCode === null) {
     // Subscribe before any stop request. Expiry is uncertainty, not exit.
     const joined = exited(child, graceMs);
     joined.catch(() => {}); // retain rejection while the bounded stop command runs
@@ -45,10 +54,12 @@ async function stopAndRemove(child, dir, { graceMs = 3000 } = {}) {
   // Detached helpers outlive their server by design (delegated work
   // survives a restart): end whatever still runs from inside this home.
   if (dir) {
-    try {
-      const P = require('../../processes.js');
-      for (const p of P.list()) if (p.pid !== process.pid && p.argv.some(a => a.includes(dir))) P.stopTree(p.pid, 'SIGKILL');
-    } catch {}
+    if (!ownedGroup) {
+      try {
+        const P = require('../../processes.js');
+        for (const p of P.list()) if (p.pid !== process.pid && p.argv.some(a => a.includes(dir))) P.stopTree(p.pid, 'SIGKILL');
+      } catch {}
+    } // An owned-group join must not widen into unrelated argv matches.
     // Windows answers EPERM, not EBUSY, for a folder a dying process (or a
     // virus scan) still holds: retried like the others, for about twenty
     // seconds by the clock. Node 24's rm does not retry by itself on every

@@ -62,14 +62,20 @@ async function closeLocalBrowser({ browser, profile, ws, closeBrowser, primaryEr
 function localMachinesCleanup(t, remove) {
   const closes = [];
   t.after(async () => {
-    const failures = [];
-    for (const close of closes.reverse()) {
-      try { await close(); } catch (error) { failures.push(error); }
+    const failures = []; let writersJoined = true;
+    for (const { close, writer } of closes.reverse()) {
+      try { await close(); }
+      catch (error) { failures.push(error); if (writer) writersJoined = false; }
     }
-    try { await remove(); } catch (error) { failures.push(error); }
+    // A browser scenario failure need not block independent server joins.
+    // An uncertain server writer must retain their shared registration store.
+    if (writersJoined) { try { await remove(); } catch (error) { failures.push(error); } }
     if (failures.length === 1) throw failures[0];
     if (failures.length) throw new AggregateError(failures, 'local-machine fixture cleanup failed');
   });
-  return { add: close => closes.push(close) };
+  return {
+    add: close => closes.push({ close, writer: false }),
+    addWriter: close => closes.push({ close, writer: true }),
+  };
 }
 module.exports = { closeLocalBrowser, localMachinesCleanup };

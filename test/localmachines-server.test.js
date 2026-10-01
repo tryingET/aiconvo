@@ -14,6 +14,7 @@ const { chromiumBinary, chromiumAvailable, CHROMIUM_TEST_FLAGS } = require('./he
 
 const { closeLocalBrowser, localMachinesCleanup } = require('./localmachines-browser-cleanup');
 const { stopAndRemove } = require('./helpers/cleanup');
+const { captureOwnedGroup } = require('./helpers/owned-process-group');
 
 const root = path.join(__dirname, '..');
 
@@ -31,13 +32,22 @@ async function boot(cleanup, { name, kind, localAppData }) {
   fs.mkdirSync(path.join(agent, 'sessions'), { recursive: true });
   const port = await freePort();
   let log = '';
-  const child = spawn(process.execPath, ['server.js'], { cwd: root, env: { ...process.env, ...require('./helpers/home-env.js').homeEnv(home),
+  const args = process.platform === 'win32' ? ['server.js'] : ['--require', path.join(__dirname, 'helpers/private-group-owner.js'), 'server.js'];
+  const child = spawn(process.execPath, args, { cwd: root, env: { ...process.env, ...require('./helpers/home-env.js').homeEnv(home),
     PORT: String(port), CHATTERING_TLS_PORT: String(await freePort()), CHATTERING_PREVIEW_PORT: String(await freePort()),
     CHATTERING_CACHE_DIR: path.join(home, 'cache'), CHATTERING_CHECKPOINT_DIR: path.join(home, 'checkpoints'), CHATTERING_DELEGATION_ROOT: path.join(home, 'delegations'),
     PI_CODING_AGENT_DIR: agent, PI_AGENT_DIR: agent, CHATTERING_HOST: '', CHATTERING_LAN: '', CHATTERING_PUBLIC_URL: '', CHATTERING_TOKEN: '',
-    CHATTERING_HOSTNAME: name, CHATTERING_LOCAL_KIND: kind, CHATTERING_LOCAL_APPDATA: localAppData }, stdio: ['ignore', 'pipe', 'pipe'] });
+    CHATTERING_HOSTNAME: name, CHATTERING_LOCAL_KIND: kind, CHATTERING_LOCAL_APPDATA: localAppData }, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe', ...(process.platform === 'win32' ? [] : ['ipc'])] });
   child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
-  cleanup.add(() => stopAndRemove(child, home));
+  let ownedGroup = null, ownershipError = null;
+  cleanup.addWriter(async () => {
+    if (ownershipError) { await stopAndRemove(child, null); throw ownershipError; }
+    await stopAndRemove(child, home, { ownedGroup });
+  });
+  if (process.platform !== 'win32') {
+    try { ownedGroup = captureOwnedGroup(child); }
+    catch (error) { ownershipError = error; throw error; }
+  }
   const base = 'http://127.0.0.1:' + port;
   for (let i = 0; i < 600; i++) {
     try { if (fs.existsSync(path.join(home, 'cache', 'lan-token')) && (await fetch(base + '/api/settings', bearer(home))).ok) break; } catch {}
