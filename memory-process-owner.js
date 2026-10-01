@@ -7,12 +7,12 @@ const same = (a, b) => !!(a && b && a.pid === b.pid && a.start === b.start && a.
 function createProcessOwner(api = processes, kill = (pid, signal) => process.kill(pid, signal)) {
   const owned = [];
   const read = (pid, deadline = Infinity) => {
-    let record = api.ownership(pid, { deadline }), id = api.identity(pid);
+    let record = api.ownership(pid, { deadline }), id = api.identity(pid, { deadline });
     if (!id && !record) return null;
     if (!id || !record) {
       // An owned process can exit between the two current observations.
       // Confirm absence; a live, reused or unreadable PID still fails closed.
-      record = api.ownership(pid, { deadline }); id = api.identity(pid);
+      record = api.ownership(pid, { deadline }); id = api.identity(pid, { deadline });
       if (!id && !record) return null;
     }
     if (!same(id, record) || !record.boot || record.boot === 'unknown' || !record.start || !Number.isSafeInteger(record.ppid))

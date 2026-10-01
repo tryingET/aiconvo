@@ -66,16 +66,22 @@ function darwinList() {
   return out;
 }
 let darwinBoot = null;
-function darwinIdentity(pid) {
+function darwinIdentity(pid, deadline) {
   let text = '';
-  try { text = execFileSync('ps', ['-o', 'lstart=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
-  catch { return null; } // ps exits 1 when the pid is gone
+  try { text = execFileSync('ps', ['-o', 'lstart=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8', timeout: Math.min(5000, windowsOwnershipTimeout(deadline)), stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+  catch (e) {
+    if (Number.isFinite(deadline)) {
+      try { process.kill(pid, 0); } catch (gone) { if (gone.code === 'ESRCH') return null; }
+      throw e;
+    }
+    return null;
+  } // ps exits 1 when the pid is gone
   if (!text) return null;
   // lstart is a fixed 24-character date ("Sat Sep 26 17:31:52 2026").
   const start = text.slice(0, 24).trim(), rest = text.slice(24).trim().split(/\s+/);
   if (/Z/.test(rest[1] || '')) return null;
   if (!darwinBoot) {
-    try { darwinBoot = (/sec = (\d+)/.exec(execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: 5000 })) || [])[1] || 'unknown'; }
+    try { darwinBoot = (/sec = (\d+)/.exec(execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', timeout: Math.min(5000, windowsOwnershipTimeout(deadline)) })) || [])[1] || 'unknown'; }
     catch { darwinBoot = 'unknown'; }
   }
   return { pid, start, boot: darwinBoot, pgrp: Number(rest[0]) || null };
@@ -160,22 +166,33 @@ function winList() {
 const winStarts = new Map(); // pid → { start, checkedAt }
 let winBoot = null;
 function winAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
-function winIdentity(pid) {
+function winIdentity(pid, deadline) {
   if (!winAlive(pid)) { winStarts.delete(pid); return null; }
   let known = winStarts.get(pid);
   // A pid is reused only after its process ended; recheck the start time
   // now and then so a reuse between two looks is still noticed.
   if (!known || Date.now() - known.checkedAt > 30000) {
     let start = null;
-    try { start = execFileSync(POWERSHELL, psArgs(winStartScript(pid)), { encoding: 'utf8', timeout: 10000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || null; }
-    catch (e) { lastIdentityProblem = `PowerShell (${POWERSHELL}) could not give pid ${pid}'s start time: ${psError(e)}`; return null; }
-    if (!start) { lastIdentityProblem = `PowerShell (${POWERSHELL}) gave no start time for pid ${pid}`; return null; }
+    try { start = execFileSync(POWERSHELL, psArgs(winStartScript(pid)), { encoding: 'utf8', timeout: windowsOwnershipTimeout(deadline), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || null; }
+    catch (e) {
+      lastIdentityProblem = `PowerShell (${POWERSHELL}) could not give pid ${pid}'s start time: ${psError(e)}`;
+      if (Number.isFinite(deadline)) {
+        try { process.kill(pid, 0); } catch (gone) { if (gone.code === 'ESRCH') return null; }
+        throw e; // a live/unreadable PID is not absence
+      }
+      return null;
+    }
+    if (!start) {
+      lastIdentityProblem = `PowerShell (${POWERSHELL}) gave no start time for pid ${pid}`;
+      if (Number.isFinite(deadline)) throw new Error(lastIdentityProblem);
+      return null;
+    }
     known = { start, checkedAt: Date.now() };
     winStarts.set(pid, known);
   }
-  if (!winBoot) {
-    try { winBoot = execFileSync(POWERSHELL, psArgs(WIN_BOOT_SCRIPT), { encoding: 'utf8', timeout: 10000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || 'unknown'; }
-    catch { winBoot = 'unknown'; }
+  if (!winBoot || (Number.isFinite(deadline) && winBoot === 'unknown')) {
+    try { winBoot = execFileSync(POWERSHELL, psArgs(WIN_BOOT_SCRIPT), { encoding: 'utf8', timeout: windowsOwnershipTimeout(deadline), windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || 'unknown'; }
+    catch (e) { if (Number.isFinite(deadline)) throw e; winBoot = 'unknown'; }
   }
   // Windows has no process groups; a detached child is its own tree root.
   return { pid, start: known.start, boot: winBoot, pgrp: pid };
@@ -188,12 +205,12 @@ function list() {
   if (PLATFORM === 'win32') return winList();
   return [];
 }
-function identity(pid) {
+function identity(pid, { deadline = Infinity } = {}) {
   lastIdentityProblem = '';
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   if (PLATFORM === 'linux') return linuxIdentity(pid);
-  if (PLATFORM === 'darwin') return darwinIdentity(pid);
-  if (PLATFORM === 'win32') return winIdentity(pid);
+  if (PLATFORM === 'darwin') return darwinIdentity(pid, deadline);
+  if (PLATFORM === 'win32') return winIdentity(pid, deadline);
   return null;
 }
 function cwd(pid) {
