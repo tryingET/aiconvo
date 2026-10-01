@@ -1,2 +1,2 @@
-["ubuntu-latest","macos-latest","windows-latest"]
-test/anywhere-client-readiness.test.js test/anywhere-home-signal-readiness.test.js test/anywhere.test.js test/anywhere-browser.test.js test/anywhere-server.test.js test/anywhere-links-server.test.js test/anywhere-identity-init.test.js test/private-file-publication.test.js test/private-file-native.test.js
+["windows-latest"]
+test/programs-watch.test.js test/programs-watch-native.test.js test/programs.test.js test/programs-live.test.js test/programs-fixture-readiness.test.js test/programs-app.test.js test/programs-live-app.test.js test/programs-make-app.test.js

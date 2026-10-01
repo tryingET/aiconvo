@@ -6360,7 +6360,10 @@ function programLogWatchStart() {
     for (const p of want) {
       if (w.handles.has(p)) continue;
       try {
-        const h = fs.watch(p, { persistent: false }, () => { if (p === folder || !p.startsWith(folder)) arm(); programLogChanged(); });
+        // libuv expands event filenames on Windows. A short (8.3) watch
+        // prefix can then abort before any JS callback. Canonicalize only
+        // the native registration; logical folder/day keys stay unchanged.
+        const h = fs.watch(fs.realpathSync.native(p), { persistent: false }, () => { if (p === folder || !p.startsWith(folder)) arm(); programLogChanged(); });
         h.on('error', () => { try { h.close(); } catch {} w.handles.delete(p); });
         w.handles.set(p, h);
       } catch {}
