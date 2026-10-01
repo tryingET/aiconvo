@@ -1,2 +1,2 @@
-["macos-latest","windows-latest"]
-test/file-view.test.js test/document-format.test.js test/file-media.test.js test/platform.test.js test/recent-files.test.js test/fileledger.test.js
+["windows-latest"]
+test/private-file-rename-abi.test.js test/private-file-native.test.js test/private-file.test.js test/private-file-races.test.js

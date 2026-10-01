@@ -116,6 +116,9 @@ if (process.platform === 'win32') {
 
   const seedAndLock = String.raw`
     [ChatteringPrivateFile]::Write($file, [System.Text.Encoding]::UTF8.GetBytes('existing identity'));
+    if (![System.IO.File]::Exists($file)) { throw 'Seed publication failed: destination absent' };
+    if (![ChatteringPrivateFile]::Inspect($file, $false)) { throw 'Seed publication failed: protected destination absent' };
+    if ([ChatteringPrivateFile]::ReadEncoded($file) -ne ('DATA:' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('existing identity')))) { throw 'Seed publication failed: wrong destination bytes' };
     $locked = [ChatteringPrivateFile]::Open($file, $false);
     try {`;
   const unchangedTarget = String.raw`
