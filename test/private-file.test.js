@@ -28,15 +28,13 @@ test('Given multiply-linked key storage, When protection is requested, Then it f
 
 test('Given Windows cannot establish or verify a DACL, When a key is saved, Then no secret bytes are written and no temporary file is left', t => {
   const dir = fixture(t), file = path.join(dir, 'key'); let writes = 0, queried = false;
-  const context = { module: { exports: {} }, Buffer, process: { platform: 'win32', env: { SystemRoot: 'C:\\Windows' } }, require(name) {
+  const context = { module: { exports: {} }, __dirname: path.dirname(require.resolve('../private-file')), Buffer, process: { platform: 'win32', env: { SystemRoot: 'C:\\Windows' } }, require(name) {
     if (name === 'node:fs') return { ...fs, writeFileSync() { writes++; assert.fail('secret written before security verification'); } };
     if (name === 'node:child_process') return { execFileSync(_exe, args) {
       queried = true;
       const script = Buffer.from(args.at(-1), 'base64').toString('utf16le');
-      assert.ok(script.includes('$f.SetAccessControl($acl)'));
-      assert.ok(script.includes('$a = $f.GetAccessControl()'));
-      const tmp = fs.readdirSync(dir); assert.equal(tmp.length, 1);
-      assert.equal(fs.statSync(path.join(dir, tmp[0])).size, 0, 'only an empty file exists before ACL verification');
+      assert.ok(script.includes('[ChatteringPrivateFile]::Write'));
+      assert.deepEqual(fs.readdirSync(dir), [], 'no permissively inherited file is created by the JS caller');
       throw new Error('synthetic ACL readback failed');
     } };
     return require(name);
@@ -50,7 +48,7 @@ test('Given an OS security failure while opening existing credentials, When Anyw
   for (const name of ['anywhere-home', 'anywhere-link']) {
     const { Module } = require('node:module');
     const file = require.resolve('../' + name), fixture = new Module(file, module);
-    fixture.require = spec => spec === './private-file' ? { ensurePrivateFileSync() { throw new Error('synthetic security denial'); } } : spec.startsWith('.') ? require(path.resolve(path.dirname(file), spec)) : require(spec);
+    fixture.require = spec => spec === './private-file' ? { readPrivateFileSync() { throw new Error('synthetic security denial'); } } : spec.startsWith('.') ? require(path.resolve(path.dirname(file), spec)) : require(spec);
     fixture._compile(fs.readFileSync(file, 'utf8'), file);
     const create = fixture.exports.createAnywhereHome || fixture.exports.createAnywhereLinks;
     assert.throws(() => create({ dataDir: '/synthetic/never-read' }), /security denial/);

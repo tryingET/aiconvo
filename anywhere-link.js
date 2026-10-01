@@ -19,7 +19,7 @@
    computer's id, its relay, the name it gave, this install's key for it,
    the device id it knows this install by, the local port, and who made it. */
 const fs = require('fs');
-const { ensurePrivateFileSync, writePrivateFileSync } = require('./private-file');
+const { readPrivateFileSync, writePrivateFileSync } = require('./private-file');
 const path = require('path');
 const http = require('http');
 const P = require('./anywhere/protocol.js');
@@ -50,10 +50,13 @@ function createAnywhereLinks(opts) {
   let stopped = false;
 
   function load() {
-    // Do not hide an OS security failure as an empty credential store.
-    try { ensurePrivateFileSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    try { const raw = JSON.parse(fs.readFileSync(file, 'utf8')); return { links: Array.isArray(raw.links) ? raw.links : [] }; }
-    catch { return { links: [] }; }
+    const bytes = readPrivateFileSync(file);
+    if (bytes === null) return { links: [] }; // only initial-open absence resets
+    const raw = JSON.parse(bytes);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Array.isArray(raw.links) ||
+        raw.links.some(link => !link || typeof link !== 'object' || Array.isArray(link)))
+      throw new Error('Corrupt Anywhere link store');
+    return { links: raw.links };
   }
   function save() {
     writePrivateFileSync(file, JSON.stringify(state, null, 1) + '\n');
