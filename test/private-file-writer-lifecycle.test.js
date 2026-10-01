@@ -50,7 +50,7 @@ test('Given production writer source, When diagnostic hooks are prepared, Then e
   const production = fs.readFileSync(path.join(__dirname, '..', 'private-file-windows.cs'), 'utf8');
   const source = observedSource(production);
   assert.equal(source.split('WriterObserver.Record(').length - 1, 8);
-  assert.ok(source.includes('int size = checked(nameOffset + name.Length);'));
+  assert.ok(source.includes('int size = checked(nameOffset + name.Length + 2);'));
 });
 
 // Compile/execute only on Windows. Linux parsing is NOT native evidence.

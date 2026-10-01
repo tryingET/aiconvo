@@ -1,5 +1,5 @@
 'use strict';
-// Native diagnostic, not a repair or a POSIX substitute. Both variants use
+// Native regression, not a POSIX substitute. Fixed and legacy variants use
 // the same canonical destination and reset state; only allocation differs.
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
@@ -7,11 +7,11 @@ const { execFileSync } = require('node:child_process');
 const { nativeRequest } = require('./private-file-bootstrap-helper');
 
 if (process.platform === 'win32') {
-  test('Given real Windows publication, When counted and terminated rename buffers are compared, Then the shipped buffer publishes the acquired object and exact bytes', t => {
+  test('Given real Windows publication, When fixed and legacy rename buffers are compared, Then the shipped buffer publishes the acquired object and exact bytes', t => {
     const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'rename-abi-')));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const production = fs.readFileSync(path.join(__dirname, '..', 'private-file-windows.cs'), 'utf8');
-    const allocation = 'int size = checked(nameOffset + name.Length);';
+    const allocation = 'int size = checked(nameOffset + name.Length + 2);';
     assert.equal(production.split(allocation).length, 2, 'experiment must change exactly one allocation');
     const observer = String.raw`
 public static class RenameObserver {
@@ -30,7 +30,7 @@ public static class RenameObserver {
     for (const mode of ['create', 'replace', 'empty']) {
       // Identical name/content/UTF-16 length across the paired variants.
       const file = path.join(dir, `${mode}-é-key`);
-      for (const variant of ['shipped', 'terminated-experiment']) {
+      for (const variant of ['shipped', 'legacy-counted']) {
         const result = { variant, mode, correct: false };
         try {
           // The native child has exited; reset only this test's owned directory.
@@ -38,7 +38,7 @@ public static class RenameObserver {
           if (mode === 'replace') fs.writeFileSync(file, 'old synthetic bytes');
           const bytes = mode === 'empty' ? '' : 'new synthetic bytes';
           const source = (variant === 'shipped' ? production : production.replace(allocation,
-            'int size = checked(nameOffset + name.Length + 2);')) + observer;
+            'int size = checked(nameOffset + name.Length);')) + observer;
           const request = nativeRequest(file, String.raw`
             $result = @{ error = $null; nativeError = $null; beforePath = $null; afterPath = $null; handleBytes = $null; protected = $false };
             $s = [ChatteringPrivateFile]::Open($file + '.tmp', $true);
