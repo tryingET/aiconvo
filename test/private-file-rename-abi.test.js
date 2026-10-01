@@ -64,8 +64,9 @@ public static class RenameObserver {
           try { $result.destinationBytes = [ChatteringPrivateFile]::ReadEncoded($file) }
           catch { $result.readError = $_.Exception.Message }
           $result.stagingExists = [System.IO.File]::Exists($file + '.tmp');
-          [Console]::Write($json.Serialize($result));`, { source: Buffer.from(source).toString('base64'), payload: bytes });
-        const observed = JSON.parse(execFileSync(request.exe, request.args, request.options).trim());
+          # Console code pages must not corrupt the observed UTF-16 pathname.
+          [Console]::Write([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json.Serialize($result))));`, { source: Buffer.from(source).toString('base64'), payload: bytes });
+        const observed = JSON.parse(Buffer.from(execFileSync(request.exe, request.args, request.options).trim(), 'base64').toString('utf8'));
         const expectedPath = '\\\\?\\' + path.resolve(file);
         const correct = observed.error === null && observed.exists && observed.protected &&
           observed.afterPath.toLowerCase() === expectedPath.toLowerCase() &&
